@@ -48,9 +48,9 @@ class _ChannelAttentionModule(nn.Module):
         return out
 
 
-class _DAHead(nn.Module):
+class DAHead(nn.Module):
     def __init__(self, in_channels, nclass, aux=True, norm_layer=nn.BatchNorm2d, norm_kwargs=None, **kwargs):
-        super(_DAHead, self).__init__()
+        super(DAHead, self).__init__()
         self.aux = aux
         inter_channels = in_channels // 4
         self.conv_p1 = nn.Sequential(

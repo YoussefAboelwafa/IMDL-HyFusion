@@ -1,2 +1,7 @@
 data/CASIA1
 data/CASIA2
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw

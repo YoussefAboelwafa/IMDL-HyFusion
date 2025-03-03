@@ -21,7 +21,20 @@ from common.split_params import group_weight
 from common.lr_schedule import WarmUpPolyLR
 from models.modal_extract import ModalitiesExtractor
 from configs.cmnext_init_cfg import _C as config, update_config
+import pretty_errors
 
+pretty_errors.configure(
+    separator_character='*',
+    filename_display=pretty_errors.FILENAME_EXTENDED,
+    line_number_first=True,
+    display_link=True,
+    lines_before=5,
+    lines_after=2,
+    line_color=pretty_errors.RED + '> ' + pretty_errors.default_config.line_color,
+    code_color='  ' + pretty_errors.default_config.line_color,
+    truncate_code=True,
+    display_locals=True
+)
 parser = argparse.ArgumentParser(description='')
 parser.add_argument('-gpu', '--gpu', type=int, default=0, help='device, use -1 for cpu')
 parser.add_argument('-log', '--log', type=str, default='INFO', help='logging level')
@@ -31,6 +44,7 @@ parser.add_argument('opts', help="other options", default=None, nargs=argparse.R
 
 args = parser.parse_args()
 
+print(torch.cuda.is_available())
 config = update_config(config, args.exp)
 
 gpu = args.gpu
@@ -39,7 +53,7 @@ logging.basicConfig(level=loglvl, format='%(message)s')
 
 device = 'cuda:%d' % gpu if gpu >= 0 else 'cpu'
 np.set_printoptions(formatter={'float': '{: 7.3f}'.format})
-
+print(f"Device: {device}")
 torch.set_flush_denormal(True)
 if device != 'cpu':
     # cudnn setting
@@ -52,7 +66,7 @@ if device != 'cpu':
 
 modal_extractor = ModalitiesExtractor(config.MODEL.MODALS[1:], config.MODEL.NP_WEIGHTS)
 if 'bayar' in config.MODEL.MODALS:
-    modal_extractor.load_state_dict(torch.load('pretrained/modal_extractor/bayar_mhsa.pth'), strict=False)
+    modal_extractor.load_state_dict(torch.load('pretrained/modal_extractor/bayar_mhsa.pth',map_location=torch.device('cpu')), strict=False)
     if not args.train_bayar:
         modal_extractor.bayar.eval()
         for param in modal_extractor.bayar.parameters():

@@ -1,2 +1,8 @@
 data/CASIA1
 data/CASIA2
+ckpt/
+pretrained/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -1,8 +1,12 @@
 data/CASIA1
 data/CASIA2
-ckpt/
-pretrained/
-__pycache__/
+__pycache__
 *.pyc
 *.pyo
 *.pyd
+*.pyw
+pretrained/
+ckpt/
+data/
+logs/
+ckpt/

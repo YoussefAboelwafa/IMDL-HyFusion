@@ -8,7 +8,9 @@ from torch.nn import functional as F
 from models.base import BaseModel
 from models.heads import SegFormerHead
 import logging
-
+from models.modules.esb import ESB
+from models.modules.segmentation import get_semantic_map
+from models.modules.dual_atten import DAHead
 
 class CMNeXtWithConf(BaseModel):
     def __init__(self, cfg=None) -> None:
@@ -21,6 +23,9 @@ class CMNeXtWithConf(BaseModel):
         self.decode_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512,
                                          num_classes)
         self.conf_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512, 1)
+
+        self.edge_branch = ESB(2)
+        self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
 
         if cfg.DETECTION == 'confpool':
             self.detection = nn.Sequential(
@@ -64,11 +69,21 @@ class CMNeXtWithConf(BaseModel):
             raise ValueError(f'Train phase {self.train_phase} not recognized!')
 
     def forward(self, x: list, masks: list = None):
+        # get semantic map
+        sem_map = get_semantic_map(image=x[0])
+        # get edge map
+        edge_map, _ = self.edge_branch(x[0])
+
         if masks is not None:
             y = self.backbone(x, masks)
         else:
             y = self.backbone(x)
-        out = self.decode_head(y)
+
+        # Pass through dual attention head
+        da_input = torch.cat((y, sem_map.unsqueeze(1), edge_map.unsqueeze(1)), dim=1)
+        da_output = self.da_head(da_input)
+
+        out = self.decode_head(da_output)
         out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
         if self.train_phase == 'detection':
             conf = self.conf_head(y)

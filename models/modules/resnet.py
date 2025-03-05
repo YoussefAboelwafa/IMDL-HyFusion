@@ -157,7 +157,7 @@ class ResNet50(nn.Module):
         for i, num_this_layer in enumerate(layers_cfg):
             self.blocks.append(list(self.model.children())[num_this_layer])
 
-    def base_forward(self, x):
+    def forward(self, x):
         feature_map = []
         x = self.model.conv1(x)
         x = self.model.bn1(x)

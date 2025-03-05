@@ -24,7 +24,7 @@ class CMNeXtWithConf(BaseModel):
                                          num_classes)
         self.conf_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512, 1)
 
-        self.edge_branch = ESB(2)
+        self.edge_branch = ESB(2,sobel=True)
         self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
 
         if cfg.DETECTION == 'confpool':
@@ -52,9 +52,13 @@ class CMNeXtWithConf(BaseModel):
         if self.train_phase == 'localization':
             self.backbone.train()
             self.decode_head.train()
+            self.edge_branch.train()
+            self.da_head.train()
         elif self.train_phase == 'detection':
             self.conf_head.train()
             self.detection.train()
+            self.backbone.eval()
+            self.decode_head.train()
         else:
             raise ValueError(f'Train phase {self.train_phase} not recognized!')
 
@@ -72,7 +76,7 @@ class CMNeXtWithConf(BaseModel):
         # get semantic map
         sem_map = get_semantic_map(image=x[0])
         # get edge map
-        edge_map, _ = self.edge_branch(x[0])
+        edges, edge_map = self.edge_branch(x[0])
 
         if masks is not None:
             y = self.backbone(x, masks)
@@ -95,7 +99,7 @@ class CMNeXtWithConf(BaseModel):
             det = self.detection(torch.cat((f1, f2), -1))
             return out, conf, det
 
-        return out
+        return out , edges , sem_map
 
     def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:
         if pretrained:

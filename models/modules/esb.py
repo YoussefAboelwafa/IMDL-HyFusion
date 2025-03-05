@@ -2,7 +2,7 @@ from torch import nn
 import torch
 import numpy as np
 from torch.nn import functional as F
-from resnet import ResNet50
+from .resnet import ResNet50
 
 
 

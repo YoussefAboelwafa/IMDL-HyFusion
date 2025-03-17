@@ -26,7 +26,11 @@ class CMNeXtWithConf(BaseModel):
 
         self.edge_branch = ESB(2,sobel=True)
         self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
-
+        self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)  # Reduce edge map to 1 channel
+        self.adjust_channels_1 = nn.Conv2d(64 + 1 + 1, 64, kernel_size=1)    # Original channels + sem_map + edge_map
+        self.adjust_channels_2 = nn.Conv2d(128 + 1 + 1, 128, kernel_size=1)
+        self.adjust_channels_3 = nn.Conv2d(320 + 1 + 1, 320, kernel_size=1)
+        self.adjust_channels_4 = nn.Conv2d(512 + 1 + 1, 512, kernel_size=1)
         if cfg.DETECTION == 'confpool':
             self.detection = nn.Sequential(
                             nn.Linear(in_features=8, out_features=128),
@@ -73,33 +77,70 @@ class CMNeXtWithConf(BaseModel):
             raise ValueError(f'Train phase {self.train_phase} not recognized!')
 
     def forward(self, x: list, masks: list = None):
-        # get semantic map
-        sem_map = get_semantic_map(image=x[0])
-        # get edge map
-        edges, edge_map = self.edge_branch(x[0])
+      # get semantic map and convert to float
+      sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
+      sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
+          
+      # get edge map
+      edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
+      edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
+      # Reduce edge map channels to 1
+      edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
 
-        if masks is not None:
-            y = self.backbone(x, masks)
-        else:
-            y = self.backbone(x)
+      if masks is not None:
+          y = self.backbone(x, masks)
+      else:
+          y = self.backbone(x)  # List of 4 tensors with different scales
+      
+      # Resize semantic map and edge map to match each feature map scale
+      enhanced_features = []
+      for idx, feat in enumerate(y):
+          # Get current feature map size
+          curr_size = feat.shape[2:]  # This will be a tuple (H, W)
+          
+          # Resize semantic map to current scale
+          sem_map_resized = F.interpolate(sem_map, 
+                                        size=curr_size,  # Pass tuple of (H, W)
+                                        mode='bilinear',
+                                        align_corners=False)
+          
+          # Resize edge map to current scale
+          edge_map_resized = F.interpolate(edge_map,
+                                        size=curr_size,  # Pass tuple of (H, W)
+                                        mode='bilinear',
+                                        align_corners=False)
+          
+          # Concatenate along channel dimension
+          enhanced_feat = torch.cat([feat, sem_map_resized, edge_map_resized], dim=1)
+          
+          # Apply 1x1 conv to match original channel dimensions
+          if idx == 0:
+              enhanced_feat = self.adjust_channels_1(enhanced_feat)  # Output channels: 64
+          elif idx == 1:
+              enhanced_feat = self.adjust_channels_2(enhanced_feat)  # Output channels: 128
+          elif idx == 2:
+              enhanced_feat = self.adjust_channels_3(enhanced_feat)  # Output channels: 320
+          else:
+              enhanced_feat = self.adjust_channels_4(enhanced_feat)  # Output channels: 512
+              
+          enhanced_features.append(enhanced_feat)
 
-        # Pass through dual attention head
-        da_input = torch.cat((y, sem_map.unsqueeze(1), edge_map.unsqueeze(1)), dim=1)
-        da_output = self.da_head(da_input)
+      # Pass through decode head
+      out = self.decode_head(enhanced_features)
+      out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 
-        out = self.decode_head(da_output)
-        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
-        if self.train_phase == 'detection':
-            conf = self.conf_head(y)
-            conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
-            from .layer_utils import weighted_statistics_pooling
-            f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
-            f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
-                out.shape[0], -1)
-            det = self.detection(torch.cat((f1, f2), -1))
-            return out, conf, det
+      if self.train_phase == 'detection':
+          conf = self.conf_head(enhanced_features)
+          conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+          from .layer_utils import weighted_statistics_pooling
+          f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
+          f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
+              out.shape[0], -1)
+          det = self.detection(torch.cat((f1, f2), -1))
+          return out, conf, det
 
-        return out , edges , sem_map
+      return out, edges, sem_map
+
 
     def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:
         if pretrained:

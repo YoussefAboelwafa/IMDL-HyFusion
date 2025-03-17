@@ -4,18 +4,19 @@ CUDNN:
   ENABLED: true
 WORKERS: 1
 ACCUMULATE_ITERS: 1
-BATCH_SIZE: 1
+BATCH_SIZE: 8
 WARMUP_EPOCHS: 2
 LEARNING_RATE: 0.005
 SGD_MOMENTUM: 0.9
 WD: 0.0005
-EPOCHS: 3
+EPOCHS: 30
+EDGE_LOSS_WEIGHT: 0.01
 
 DATASET:
   NUM_CLASSES: 2
   TRAIN:
-    - './data/CAT-Net_splits/train/CASIA_v2_manip.txt'
-    - './data/CAT-Net_splits/train/CASIA_v2_auth.txt'
+    - 'data/CAT-Net_splits/train/CASIA_v2_manip.txt'
+    - 'data/CAT-Net_splits/train/CASIA_v2_auth.txt'
     # - './data/CAT-Net_splits/train/IMD2020.txt'
     # - './data/CAT-Net_splits/train/FantasticReality_manip.txt'
     # - './data/CAT-Net_splits/train/FantasticReality_auth.txt'
@@ -25,8 +26,8 @@ DATASET:
     # - './data/CAT-Net_splits/train/bcmc_COCO.txt'
     # - './data/CAT-Net_splits/train/compRAISE.txt'
   VAL:
-    - './data/CAT-Net_splits/val/CASIA_v2_manip.txt'
-    - './data/CAT-Net_splits/val/CASIA_v2_auth.txt'
+    - 'data/CAT-Net_splits/val/CASIA_v2_manip.txt'
+    - 'data/CAT-Net_splits/val/CASIA_v2_auth.txt'
     # - './data/CAT-Net_splits/val/IMD2020.txt'
     # - './data/CAT-Net_splits/val/FantasticReality_manip.txt'
     # - './data/CAT-Net_splits/val/FantasticReality_auth.txt'

@@ -1,4 +1,5 @@
-pint="~/.conda/envs/cv-dev/bin/python"
+pint=# Insert path to python interpreter
+
 dso1_manip="./data/IDT-DSO-1-manip.txt"
 dso1_auth="./data/IDT-DSO-1-auth.txt"
 cover_manip="./data/IDT-COVER-manip.txt"

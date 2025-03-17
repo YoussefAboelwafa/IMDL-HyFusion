@@ -4,8 +4,6 @@ import numpy as np
 from torch.nn import functional as F
 from .resnet import ResNet50
 
-
-
 def get_sobel(in_chan, out_chan):
     filter_x = np.array([
         [1, 0, -1],
@@ -38,13 +36,11 @@ def get_sobel(in_chan, out_chan):
     sobel_y = nn.Sequential(conv_y, nn.BatchNorm2d(out_chan))
     return sobel_x, sobel_y
 
-
 def run_sobel(conv_x, conv_y, input):
     g_x = conv_x(input)
     g_y = conv_y(input)
     g = torch.sqrt(torch.pow(g_x, 2) + torch.pow(g_y, 2))
     return torch.sigmoid(g) * input
-
 
 def rgb2gray(rgb):
     b, g, r = rgb[:, 0, :, :], rgb[:, 1, :, :], rgb[:, 2, :, :]
@@ -55,7 +51,6 @@ def rgb2gray(rgb):
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=1, bias=False)
-
 
 class ERB(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -75,13 +70,10 @@ class ERB(nn.Module):
         if relu:
             return self.relu(x + res)
         else:
-            return x+res
-
-
+            return x + res
 
 class ESB(nn.Module):
-
-    def __init__(self, num_classes, sobel, n_input=3, pretrained = True, **kwargs):
+    def __init__(self, num_classes, sobel, n_input=3, pretrained=True, **kwargs):
         super(ESB, self).__init__()
         self.sobel = sobel
         self.num_classes = num_classes
@@ -103,22 +95,55 @@ class ESB(nn.Module):
             self.sobel_x3, self.sobel_y3 = get_sobel(1024, 1)
             self.sobel_x4, self.sobel_y4 = get_sobel(2048, 1)
 
+        # Add final upsampling layer to match input image size
+        self.final_upsample = nn.Upsample(scale_factor=4, mode="bilinear", align_corners=True)
+
     def forward(self, x):
         input_ = x.clone()
         feature_map, _ = self.backbone(input_)
         c1, c2, c3, c4 = feature_map
 
-        if self.sobel:
-            res1 = self.erb_db_1(run_sobel(self.sobel_x1, self.sobel_y1, c1))
-            res1 = self.erb_trans_1(res1 + self.upsample(self.erb_db_2(run_sobel(self.sobel_x2, self.sobel_y2, c2))))
-            res1 = self.erb_trans_2(res1 + self.upsample_4(self.erb_db_3(run_sobel(self.sobel_x3, self.sobel_y3, c3))))
-            res1 = self.erb_trans_3(res1 + self.upsample_4(self.erb_db_4(run_sobel(self.sobel_x4, self.sobel_y4, c4))), relu=False)
+        # Store original spatial dimensions of c1 for later use
+        target_size = c1.shape[2:]
 
+        if self.sobel:
+            # Process first feature map
+            res1 = self.erb_db_1(run_sobel(self.sobel_x1, self.sobel_y1, c1))
+            
+            # Process second feature map
+            res2 = self.erb_db_2(run_sobel(self.sobel_x2, self.sobel_y2, c2))
+            res2 = F.interpolate(res2, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_1(res1 + res2)
+            
+            # Process third feature map
+            res3 = self.erb_db_3(run_sobel(self.sobel_x3, self.sobel_y3, c3))
+            res3 = F.interpolate(res3, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_2(res1 + res3)
+            
+            # Process fourth feature map
+            res4 = self.erb_db_4(run_sobel(self.sobel_x4, self.sobel_y4, c4))
+            res4 = F.interpolate(res4, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_3(res1 + res4, relu=False)
         else:
+            # Similar changes for non-sobel path
             res1 = self.erb_db_1(c1)
-            res1 = self.erb_trans_1(res1 + self.upsample(self.erb_db_2(c2)))
-            res1 = self.erb_trans_2(res1 + self.upsample_4(self.erb_db_3(c3)))
-            res1 = self.erb_trans_3(res1 + self.upsample_4(self.erb_db_4(c4)), relu=False)
+            
+            res2 = self.erb_db_2(c2)
+            res2 = F.interpolate(res2, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_1(res1 + res2)
+            
+            res3 = self.erb_db_3(c3)
+            res3 = F.interpolate(res3, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_2(res1 + res3)
+            
+            res4 = self.erb_db_4(c4)
+            res4 = F.interpolate(res4, size=target_size, mode='bilinear', align_corners=True)
+            res1 = self.erb_trans_3(res1 + res4, relu=False)
+
+        # Upsample to input image size
+        res1 = self.final_upsample(res1)
         
-        return res1 , c4
-    
+        res1 = res1.sum(dim=1, keepdim=True).squeeze(1)
+
+        return res1, c4
+        

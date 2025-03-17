@@ -1,3 +1,8 @@
-exp="/mnt/c/Users/a.samir/Desktop/WS/IMDL-HyFusion/experiments/ec_example.yaml"
+source data.sh
+
+exp="./experiments/ec_example.yaml"
 ckpt="./ckpt/ec_example/best_val_loss.pth"
-python ec_train.py --exp $exp --gpu '-1'
+
+$pint ec_train.py --exp $exp
+
+python ec_train.py --exp experiments/ec_example.yaml --gpu 0

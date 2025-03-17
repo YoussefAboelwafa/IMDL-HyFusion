@@ -16,15 +16,32 @@ import torchvision.transforms.functional as TF
 
 from data.datasets import MixDataset
 from common.metrics import computeLocalizationMetrics
+# from common.losses import edge_loss
 from models.cmnext_conf import CMNeXtWithConf
 from common.split_params import group_weight
 from common.lr_schedule import WarmUpPolyLR
 from models.modal_extract import ModalitiesExtractor
 from configs.cmnext_init_cfg import _C as config, update_config
 import pretty_errors
-
+import cv2
+import os.path as osp
 import gc
+import wandb
 gc.collect()
+
+def edge_loss(pred, target, weights=None):
+    """
+    Binary cross entropy loss for edge detection
+    """
+    if weights is None:
+        weights = torch.ones_like(target)
+    
+    # Apply class weights
+    from torch.nn import functional as F
+    weights = weights.float()
+    loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights, reduction='mean')
+    return loss
+
 
 pretty_errors.configure(
     separator_character='*',
@@ -46,7 +63,7 @@ if __name__ == '__main__':
     parser.add_argument('-train_bayar', '--train_bayar', action='store_true', help='finetune bayar conv')
     parser.add_argument('-exp', '--exp', type=str, default=None, help='Yaml experiment file')
     parser.add_argument('opts', help="other options", default=None, nargs=argparse.REMAINDER)
-
+    parser.add_argument('--ckpt', type=str, default='', help='Resume from checkpoint path')
     args = parser.parse_args()
 
     print(torch.cuda.is_available())
@@ -78,7 +95,19 @@ if __name__ == '__main__':
                 param.requires_grad = False
 
     model = CMNeXtWithConf(config.MODEL)
-
+    wandb.init(
+        project="mmfusion",  # replace with your project name
+        name=config.MODEL.NAME,    # use model name as run name
+        config={
+            "learning_rate": config.LEARNING_RATE,
+            "architecture": "CMNeXtWithConf",
+            "backbone": config.MODEL.BACKBONE,
+            "epochs": config.EPOCHS,
+            "batch_size": config.BATCH_SIZE,
+            "image_size": config.DATASET.IMG_SIZE,
+            "modalities": config.MODEL.MODALS,
+        }
+    )
     modal_extractor.to(device)
     model = model.to(device)
 
@@ -138,34 +167,90 @@ if __name__ == '__main__':
                             total_iters=max_iters,
                             warmup_steps=iters_per_epoch * config.WARMUP_EPOCHS)
 
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.cuda.amp.GradScaler()
 
     del params
     del cmnext_params
     del modal_extract_params
     gc.collect()
     torch.cuda.empty_cache()
-    for epoch in range(config.EPOCHS):
-        train.shuffle()  
+    SAVE_FREQ = 100
+
+    if args.ckpt and os.path.exists(args.ckpt):
+        logging.info(f'Loading checkpoint from {args.ckpt}')
+        ckpt = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        modal_extractor.load_state_dict(ckpt['extractor_state_dict']) 
+        start_epoch = ckpt['epoch'] + 1
+    else:
+        start_epoch = 0
+    def train_epoch(epoch, model, modal_extractor, train_loader, criterion, optimizer, scaler, writer, device, config):
+        """Run one training epoch"""
         model.set_train()
         if args.train_bayar:
             modal_extractor.set_train()
+        
         avg_loss = AverageMeter()
+        edge_loss_avg = AverageMeter()
+        iters_per_epoch = len(train_loader)
+        
+        pbar = tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
         optimizer.zero_grad(set_to_none=True)
-        pbar = tqdm(train_loader, desc='Training Epoch {}/{}'.format(epoch + 1, config.EPOCHS), unit='steps')
-        for step, (images, _, masks, _) in enumerate(pbar):
-
+        
+        for step, (images, name, masks, _) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             masks = masks.squeeze(1).to(device, non_blocking=True)
+            
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 modals = modal_extractor(images)
-
                 images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                 inp = [images_norm] + modals
-
-                pred, edges, sem_map = model(inp)
-
+                
+                pred, edge, sem_map = model(inp)
+                
+                edge_gt = torch.zeros_like(edge)
+                edge_gt[masks == 1] = 1
+                
+                edge_loss_val = edge_loss(edge, edge_gt)
                 loss = criterion(pred, masks) / config.ACCUMULATE_ITERS
+                loss += edge_loss_val * config.EDGE_LOSS_WEIGHT
+                loss = loss + edge_loss_val
+
+                if (step + 1) % SAVE_FREQ == 0:
+                    maps_dir = osp.join('./outputs', config.MODEL.NAME, f'step_{step}')
+                    os.makedirs(maps_dir, exist_ok=True)
+
+                    # Convert predictions to numpy and process for visualization
+                    pred_softmax = torch.nn.functional.softmax(pred, dim=1)
+                    pred_prob = pred_softmax[:, 1, :, :].cpu().detach().numpy()  # Get probability for class 1
+                    edge_prob = torch.sigmoid(edge).cpu().detach().numpy()
+                    sem_map_np = sem_map.cpu().detach().numpy()
+
+                    # Save prediction maps for each image in batch
+                    for idx, img_name in enumerate(name):
+                        # Save probability map
+                        print(f'Saving maps for {img_name}')
+                        prob_map = (pred_prob[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_prob.png'), prob_map)
+                        
+                        # Save binary map with threshold 0.5
+                        binary_map = (pred_prob[idx] > 0.5).astype(np.uint8) * 255
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_binary.png'), binary_map)
+                        
+                        # Save edge map
+                        edge_map_vis = (edge_prob[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_edge.png'), edge_map_vis)
+
+                        # Save ground truth
+                        gt = (masks[idx].cpu().numpy() * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_gt.png'), gt)
+
+                        # Save semantic map
+                        sem_map_vis = (sem_map_np[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_sem.png'), sem_map_vis)
+
+                
+                
             scaler.scale(loss).backward()
             if ((step + 1) % config.ACCUMULATE_ITERS == 0) or (step + 1 == len(train_loader)):
                 scaler.step(optimizer)
@@ -173,9 +258,15 @@ if __name__ == '__main__':
                 optimizer.zero_grad(set_to_none=True)
 
             avg_loss.update(loss.detach().item())
+            edge_loss_avg.update(edge_loss_val.detach().item())
 
             curr_iters = epoch * iters_per_epoch + step
             lr_schedule.step(cur_iter=curr_iters)
+            wandb.log({
+                    "train/step_loss": loss.detach().item(),
+                    "train/edge_loss": edge_loss_val.detach().item(),
+                    "train/learning_rate": optimizer.param_groups[0]['lr']
+                }, step=curr_iters)
             writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], curr_iters)
 
             if step == 0:
@@ -184,31 +275,52 @@ if __name__ == '__main__':
                                 torch.cat((
                                     images,
                                     torch.tile(masks.unsqueeze(1), (1, 3, 1, 1)),
-                                    torch.tile(maps.unsqueeze(1), (1, 3, 1, 1))), -2)
-                                , epoch)
+                                    torch.tile(maps.unsqueeze(1), (1, 3, 1, 1))), -2),
+                                epoch)
 
             pbar.set_postfix({"last_loss": loss.detach().item(), "epoch_loss": avg_loss.average()})
+        
         writer.add_scalar('Training Loss', avg_loss.average(), epoch)
-        f1 = []
-        f1th = []
-        val_loss_avg = AverageMeter()
+        wandb.log({
+            "train/epoch_loss": avg_loss.average(),
+            "train/epoch_edge_loss": edge_loss_avg.average(),
+            "epoch": epoch
+        })
+        return avg_loss.average()
+
+    def validate_epoch(epoch, model, modal_extractor, val_loader, criterion, writer, device, config):
+        """Run one validation epoch"""
         model.set_val()
         modal_extractor.set_val()
-        pbar = tqdm(val_loader, desc='Validating Epoch {}/{}'.format(epoch + 1, config.EPOCHS), unit='steps')
+        
+        val_loss_avg = AverageMeter()
+        edge_val_loss_avg = AverageMeter()
+        f1 = []
+        f1th = []
+        
+        pbar = tqdm(val_loader, desc=f'Validating Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
+        
         for step, (images, _, masks, lab) in enumerate(pbar):
             with torch.no_grad():
                 images = images.to(device, non_blocking=True)
                 masks = masks.squeeze(1).to(device, non_blocking=True)
+                
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     modals = modal_extractor(images)
-
                     images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                     inp = [images_norm] + modals
-
-                    pred = model(inp)
-
+                    
+                    pred, edge, sem_map = model(inp)
+                    
+                    # edge_gt = torch.zeros_like(edge)
+                    # edge_gt[masks == 1] = 1
+                    
+                    # edge_loss_val = edge_loss(edge, edge_gt)
                     val_loss = criterion(pred, masks)
+
                 val_loss_avg.update(val_loss.detach().item())
+                # edge_val_loss_avg.update(edge_loss_val.detach().item())
+
                 gt = masks.squeeze().cpu().numpy()
                 map = torch.nn.functional.softmax(pred, dim=1)[:, 1, :, :].squeeze().cpu().numpy()
                 F1_best, F1_th = computeLocalizationMetrics(map, gt)
@@ -218,15 +330,63 @@ if __name__ == '__main__':
         writer.add_scalar('Val Loss', val_loss_avg.average(), epoch)
         writer.add_scalar('Val F1 best', np.nanmean(f1), epoch)
         writer.add_scalar('Val F1 fixed', np.nanmean(f1th), epoch)
-        if val_loss_avg.average() < min_loss:
-            min_loss = val_loss_avg.average()
-            result = {'epoch': epoch, 'val_loss': val_loss_avg.average(), 'val_f1_best': np.nanmean(f1),
-                    'val_f1_fixed': np.nanmean(f1th), 'state_dict': model.state_dict(),
-                    'extractor_state_dict': modal_extractor.state_dict()}
-            torch.save(result, './ckpt/{}/best_val_loss.pth'.format(config.MODEL.NAME))
+        metrics = {
+            "val/loss": val_loss_avg.average(),
+            "val/f1_best": np.nanmean(f1),
+            "val/f1_fixed": np.nanmean(f1th),
+            "epoch": epoch
+        }
+        wandb.log(metrics)
+        return val_loss_avg.average(), np.nanmean(f1), np.nanmean(f1th)
 
-    result = {'epoch': config.EPOCHS - 1, 'val_loss': val_loss_avg.average(), 'val_f1_best': np.nanmean(f1),
-            'val_f1_fixed': np.nanmean(f1th), 'state_dict': model.state_dict(),
-            'extractor_state_dict': modal_extractor.state_dict()}
-    torch.save(result, './ckpt/{}/final.pth'.format(config.MODEL.NAME))
-    writer.close()
+    # Replace the training loop with:
+    min_loss = 100
+    for epoch in range(start_epoch, config.EPOCHS):
+        train.shuffle()  # for balanced sampling
+
+
+        # # Validation phase
+        # val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
+        #                                             criterion, writer, device, config)
+        # Training phase
+        train_loss = train_epoch(epoch, model, modal_extractor, train_loader, criterion, 
+                                optimizer, scaler, writer, device, config)
+        # Validation phase
+        val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
+                                                    criterion, writer, device, config)
+        
+        
+        # Save best model
+        if val_loss < min_loss:
+            min_loss = val_loss
+            result = {
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'val_f1_best': f1_best,
+                'val_f1_fixed': f1_fixed,
+                'state_dict': model.state_dict(),
+                'extractor_state_dict': modal_extractor.state_dict()
+            }
+            save_path = f'./ckpt/{config.MODEL.NAME}/best_val_loss.pth'
+            torch.save(result, save_path)
+            
+            # Log best model to wandb
+            wandb.log({
+                "best_val_loss": val_loss,
+                "best_f1_best": f1_best,
+                "best_f1_fixed": f1_fixed,
+                "best_model_epoch": epoch
+            })
+            wandb.save(save_path)            
+        writer.flush()
+
+    # Save final model
+    result = {
+        'epoch': config.EPOCHS - 1,
+        # 'val_loss': val_loss,
+        # 'val_f1_best': f1_best,
+        # 'val_f1_fixed': f1_fixed,
+        'state_dict': model.state_dict(),
+        'extractor_state_dict': modal_extractor.state_dict()
+    }
+    torch.save(result, f'./ckpt/{config.MODEL.NAME}/final.pth')

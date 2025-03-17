@@ -10,3 +10,5 @@ ckpt/
 data/
 logs/
 ckpt/
+wandb/
+*.log

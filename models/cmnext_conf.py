@@ -11,6 +11,8 @@ import logging
 from models.modules.esb import ESB
 from models.modules.segmentation import get_semantic_map
 from models.modules.dual_atten import DAHead
+# 1. Implement gradient checkpointing
+from torch.utils.checkpoint import checkpoint
 
 class CMNeXtWithConf(BaseModel):
     def __init__(self, cfg=None) -> None:

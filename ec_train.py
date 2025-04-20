@@ -42,7 +42,9 @@ def edge_loss(pred, target, weights=None):
     loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights, reduction='mean')
     return loss
 
-
+import warnings
+warnings.filterwarnings("ignore", message="libpng warning: iCCP: known incorrect sRGB profile")
+warnings.filterwarnings("ignore", message="libpng warning: iCCP: profile 'ICC profile': 'bTRC': ICC profile tag start not a multiple of 4")
 pretty_errors.configure(
     separator_character='*',
     filename_display=pretty_errors.FILENAME_EXTENDED,
@@ -214,7 +216,6 @@ if __name__ == '__main__':
                 edge_loss_val = edge_loss(edge, edge_gt)
                 loss = criterion(pred, masks) / config.ACCUMULATE_ITERS
                 loss += edge_loss_val * config.EDGE_LOSS_WEIGHT
-                loss = loss + edge_loss_val
 
                 if (step + 1) % SAVE_FREQ == 0:
                     maps_dir = osp.join('./outputs', config.MODEL.NAME, f'step_{step}')
@@ -250,8 +251,19 @@ if __name__ == '__main__':
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_sem.png'), sem_map_vis)
 
                 
-                
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.1, patience=5
+            )
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Add proper weight decay
+            # config.WD = 0.0001
             scaler.scale(loss).backward()
+            if config.WD > 0:
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.data.add_(config.WD, param.data)
+
             if ((step + 1) % config.ACCUMULATE_ITERS == 0) or (step + 1 == len(train_loader)):
                 scaler.step(optimizer)
                 scaler.update()

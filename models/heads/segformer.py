@@ -27,23 +27,58 @@ class ConvModule(nn.Module):
 
 
 class SegFormerHead(nn.Module):
-    def __init__(self, dims: list, embed_dim: int = 256, num_classes: int = 19):
+    def __init__(self, dims: list, embed_dim: int = 256, num_classes: int = 19, dropout_rate: float = 0.1):
         super().__init__()
-        for i, dim in enumerate(dims):
-            self.add_module(f"linear_c{i+1}", MLP(dim, embed_dim))
-
-        self.linear_fuse = ConvModule(embed_dim*4, embed_dim)
-        self.linear_pred = nn.Conv2d(embed_dim, num_classes, 1)
-        self.dropout = nn.Dropout2d(0.1)
+        self.mlps = nn.ModuleList([
+            MLP(dim, embed_dim) for dim in dims
+        ])
+        
+        # Enhanced fusion module with channel attention
+        self.linear_fuse = nn.Sequential(
+            ConvModule(embed_dim * 4, embed_dim),
+            ChannelAttention(embed_dim)
+        )
+        
+        # Enhanced prediction head
+        self.linear_pred = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 2, 1),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.ReLU(True),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(embed_dim // 2, num_classes, 1)
+        )
 
     def forward(self, features: Tuple[Tensor, Tensor, Tensor, Tensor]) -> Tensor:
         B, _, H, W = features[0].shape
-        outs = [self.linear_c1(features[0]).permute(0, 2, 1).reshape(B, -1, *features[0].shape[-2:])]
-
-        for i, feature in enumerate(features[1:]):
-            cf = eval(f"self.linear_c{i+2}")(feature).permute(0, 2, 1).reshape(B, -1, *feature.shape[-2:])
-            outs.append(F.interpolate(cf, size=(H, W), mode='bilinear', align_corners=False))
-
+        
+        # Process features in parallel using torch.jit
+        @torch.jit.script
+        def process_features(feat, mlp, size):
+            x = mlp(feat).permute(0, 2, 1).reshape(B, -1, *feat.shape[-2:])
+            return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+            
+        outs = [process_features(features[i], self.mlps[i], (H, W)) 
+                for i in range(len(features))]
+        
+        # Enhanced fusion and prediction
         seg = self.linear_fuse(torch.cat(outs[::-1], dim=1))
-        seg = self.linear_pred(self.dropout(seg))
+        seg = self.linear_pred(seg)
+        
         return seg
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)

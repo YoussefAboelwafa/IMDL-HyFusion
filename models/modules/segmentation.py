@@ -5,8 +5,9 @@ import torch
 import warnings
 import matplotlib.pyplot as plt
 import logging
+import torch.nn.functional as F
 
-def get_semantic_map(image, yolo_model_path="yolo11x-seg.pt", mask_threshold=0.5):
+def get_semantic_map(image, yolo_model_path="yolo11x-seg.pt", mask_threshold=0.5, device=None):
     """
     Given a batch of input images and a YOLO segmentation model,
     run inference and produce a batch of semantic maps where each pixel is labeled with its class id.
@@ -24,47 +25,54 @@ def get_semantic_map(image, yolo_model_path="yolo11x-seg.pt", mask_threshold=0.5
     warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
     logging.getLogger('ultralytics').setLevel(logging.ERROR)
     # Load YOLO model
-    model = YOLO(yolo_model_path)
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Initialize list to store semantic maps
-    semantic_maps = []
+    # Suppress warnings more efficiently
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=logging.WARNING)
+        
+        # Load YOLO model (with caching)
+        model = get_cached_yolo_model(yolo_model_path).to(device)
+        
+        # Process batch efficiently
+        semantic_maps = []
+        with torch.no_grad():  # Prevent memory leaks
+            for img in image:
+                # Optimize image preprocessing
+                img_np = img.cpu().numpy().transpose(1, 2, 0)
+                img_np = cv2.normalize(img_np, None, 0, 1, cv2.NORM_MINMAX)
+                img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+                
+                # Run inference
+                results = model(img_rgb, verbose=False)
+                result = results[0]
+                
+                # Create semantic map efficiently
+                semantic_map = torch.zeros((img.shape[1], img.shape[2]), 
+                                        dtype=torch.uint8, device=device)
+                
+                if result.masks is not None:
+                    masks = result.masks.data
+                    classes = result.boxes.cls.to(device)
+                    
+                    # Vectorized operations for mask processing
+                    for mask, cls in zip(masks, classes):
+                        mask = F.interpolate(mask.unsqueeze(0), 
+                                          size=(semantic_map.shape[0], semantic_map.shape[1]),
+                                          mode='nearest').squeeze(0)
+                        semantic_map[mask > mask_threshold] = cls.int() + 1
+                
+                semantic_maps.append(semantic_map)
+        
+        return torch.stack(semantic_maps)
+
+def get_cached_yolo_model(model_path):
+    """Cache YOLO model to prevent reloading"""
+    if not hasattr(get_cached_yolo_model, 'cache'):
+        get_cached_yolo_model.cache = {}
     
-    # Iterate over each image in the batch
-    for img in image:
-        # Convert image tensor to numpy array and squeeze batch dimension
-        img = img.cpu().numpy().transpose(1, 2, 0)  # Convert to (Height, Width, Channel)
-        
-        # Scale image data to the valid range for imshow
-        img = (img - img.min()) / (img.max() - img.min())
-        
-        
-        # Convert img from BGR to RGB since YOLO expects RGB
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Run inference on the img
-        results = model(img_rgb)
-        result = results[0]  # Assumes one img
-        
-        # Initialize semantic map with zeros (background label)
-        semantic_map = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
-        
-        if result.masks is not None:
-            # Extract instance masks and corresponding class labels
-            masks = result.masks.data.cpu().numpy()  # shape: [num_instances, height, width]
-            classes = result.boxes.cls.cpu().numpy().astype(np.int32)
-            
-            # Process each instance mask: threshold and assign class id (offset by 1 so that 0 remains background)
-            for mask, cls in zip(masks, classes):
-                binary_mask = mask > mask_threshold
-                # Resize binary_mask to match the dimensions of semantic_map
-                binary_mask_resized = cv2.resize(binary_mask.astype(np.uint8), (semantic_map.shape[1], semantic_map.shape[0]), interpolation=cv2.INTER_NEAREST)
-                semantic_map[binary_mask_resized.astype(bool)] = cls + 1
-        
-        # Append the semantic map to the list
-        plt.imshow(semantic_map)
-        semantic_maps.append(semantic_map)
+    if model_path not in get_cached_yolo_model.cache:
+        get_cached_yolo_model.cache[model_path] = YOLO(model_path)
     
-    # Convert list of semantic maps to numpy array
-    semantic_maps = np.array(semantic_maps)
-    
-    return torch.tensor(semantic_maps).to(image.device)
+    return get_cached_yolo_model.cache[model_path]

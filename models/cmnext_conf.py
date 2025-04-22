@@ -19,40 +19,59 @@ class CMNeXtWithConf(BaseModel):
         backbone = cfg.BACKBONE
         num_classes = cfg.NUM_CLASSES
         modals = cfg.MODALS
-        logging.info('Currently training for {}'.format(cfg.TRAIN_PHASE))
-        logging.info('Loading Model: {}, with backbone: {}'.format(cfg.NAME, cfg.BACKBONE))
+        logging.info(f'Training phase: {cfg.TRAIN_PHASE}')
+        logging.info(f'Loading Model: {cfg.NAME}, backbone: {cfg.BACKBONE}')
         super().__init__(backbone, num_classes, modals)
-        self.decode_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512,
-                                         num_classes)
-        self.conf_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512, 1)
-
-        self.edge_branch = ESB(2,sobel=True)
-        self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
-        self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)  # Reduce edge map to 1 channel
-        self.adjust_channels_1 = nn.Conv2d(64 + 1 + 1, 64, kernel_size=1)    # Original channels + sem_map + edge_map
-        self.adjust_channels_2 = nn.Conv2d(128 + 1 + 1, 128, kernel_size=1)
-        self.adjust_channels_3 = nn.Conv2d(320 + 1 + 1, 320, kernel_size=1)
-        self.adjust_channels_4 = nn.Conv2d(512 + 1 + 1, 512, kernel_size=1)
+        
+        # Get backbone channels
+        channels = self.backbone.channels
+        hidden_dim = 256 if 'B0' in backbone or 'B1' in backbone else 512
+        
+        # Initialize heads
+        self.decode_head = SegFormerHead(channels, hidden_dim, num_classes)
+        self.conf_head = SegFormerHead(channels, hidden_dim, 1)
+        
+        # Edge detection branch
+        self.edge_branch = ESB(2, sobel=True)
+        self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)
+        
+        # Channel adjustment layers with BatchNorm and ReLU
+        self.adjust_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c + 2, c, kernel_size=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True)
+            ) for c in [64, 128, 320, 512]
+        ])
+        
+        # Detection head
         if cfg.DETECTION == 'confpool':
             self.detection = nn.Sequential(
-                            nn.Linear(in_features=8, out_features=128),
-                            nn.ReLU(),
-                            nn.Dropout(p=0.5),
-                            nn.Linear(in_features=128, out_features=1),
-                            )
-        self.apply(self._init_weights)
+                nn.Linear(8, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.5),
+                nn.BatchNorm1d(128),
+                nn.Linear(128, 1),
+                nn.Sigmoid()
+            )
+            
         self.train_phase = cfg.TRAIN_PHASE
         assert self.train_phase in ['localization', 'detection']
+        
+        # Initialize weights and load pretrained
+        self.apply(self._init_weights)
         self.init_pretrained(cfg.PRETRAINED, backbone)
+        
+        # Freeze parameters for detection phase
         if self.train_phase == 'detection':
-            self.backbone.eval()
-            self.decode_head.eval()
-            self.conf_head.train()
-            self.detection.train()
-            for p in self.decode_head.parameters():
-                p.requires_grad = False
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+            self._freeze_localization_params()
+            
+    def _freeze_localization_params(self):
+        """Freeze backbone and localization head parameters"""
+        for module in [self.backbone, self.decode_head]:
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
 
     def set_train(self):
         if self.train_phase == 'localization':

@@ -52,62 +52,71 @@ class DAHead(nn.Module):
     def __init__(self, in_channels, nclass, aux=True, norm_layer=nn.BatchNorm2d, norm_kwargs=None, **kwargs):
         super(DAHead, self).__init__()
         self.aux = aux
-        inter_channels = in_channels // 4
-        self.conv_p1 = nn.Sequential(
-            nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-            norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
-            nn.ReLU(True)
-        )
-        self.conv_c1 = nn.Sequential(
-            nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-            norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
-            nn.ReLU(True)
-        )
-        self.pam = _PositionAttentionModule(inter_channels, **kwargs)
-        self.cam = _ChannelAttentionModule(**kwargs)
-        self.conv_p2 = nn.Sequential(
-            nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
-            norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
-            nn.ReLU(True)
-        )
-        self.conv_c2 = nn.Sequential(
-            nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
-            norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
-            nn.ReLU(True)
-        )
-        self.out = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Conv2d(inter_channels, nclass, 1)
-        )
-        if aux:
-            self.conv_p3 = nn.Sequential(
-                nn.Dropout(0.1),
-                nn.Conv2d(inter_channels, nclass, 1)
+        
+        # Create separate attention modules for each feature level
+        self.attention_modules = nn.ModuleList()
+        
+        # Handle input as list of channel sizes if it's a list
+        if isinstance(in_channels, list):
+            self.feature_levels = len(in_channels)
+            for channels in in_channels:
+                attention_module = self._create_attention_module(
+                    channels, channels, channels, norm_layer, norm_kwargs, **kwargs
+                )
+                self.attention_modules.append(attention_module)
+        else:
+            self.feature_levels = 1
+            attention_module = self._create_attention_module(
+                in_channels, in_channels, in_channels, norm_layer, norm_kwargs, **kwargs
             )
-            self.conv_c3 = nn.Sequential(
-                nn.Dropout(0.1),
-                nn.Conv2d(inter_channels, nclass, 1)
+            self.attention_modules.append(attention_module)
+
+    def _create_attention_module(self, in_channels, inter_channels, out_channels, norm_layer, norm_kwargs, **kwargs):
+        return nn.ModuleDict({
+            'conv_p1': nn.Sequential(
+                nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
+                norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
+                nn.ReLU(True)
+            ),
+            'conv_c1': nn.Sequential(
+                nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
+                norm_layer(inter_channels, **({} if norm_kwargs is None else norm_kwargs)),
+                nn.ReLU(True)
+            ),
+            'pam': _PositionAttentionModule(inter_channels, **kwargs),
+            'cam': _ChannelAttentionModule(**kwargs),
+            'conv_p2': nn.Sequential(
+                nn.Conv2d(inter_channels, out_channels, 3, padding=1, bias=False),
+                norm_layer(out_channels, **({} if norm_kwargs is None else norm_kwargs)),
+                nn.ReLU(True)
+            ),
+            'conv_c2': nn.Sequential(
+                nn.Conv2d(inter_channels, out_channels, 3, padding=1, bias=False),
+                norm_layer(out_channels, **({} if norm_kwargs is None else norm_kwargs)),
+                nn.ReLU(True)
             )
+        })
+
+    def _process_single_level(self, x, module):
+        feat_p = module['conv_p1'](x)
+        feat_p = module['pam'](feat_p)
+        feat_p = module['conv_p2'](feat_p)
+
+        feat_c = module['conv_c1'](x)
+        feat_c = module['cam'](feat_c)
+        feat_c = module['conv_c2'](feat_c)
+
+        feat_fusion = feat_p + feat_c + x  # Add residual connection
+        
+        return feat_fusion
 
     def forward(self, x):
-        feat_p = self.conv_p1(x)
-        feat_p = self.pam(feat_p)
-        feat_p = self.conv_p2(feat_p)
-
-        feat_c = self.conv_c1(x)
-        feat_c = self.cam(feat_c)
-        feat_c = self.conv_c2(feat_c)
-
-        feat_fusion = feat_p + feat_c
-
+        if not isinstance(x, list):
+            x = [x]
+            
         outputs = []
-        fusion_out = self.out(feat_fusion)
-        outputs.append(fusion_out)
-        if self.aux:
-            p_out = self.conv_p3(feat_p)
-            c_out = self.conv_c3(feat_c)
-            outputs.append(p_out)
-            outputs.append(c_out)
-
-        return tuple(outputs)
-
+        for idx, feature in enumerate(x):
+            enhanced_feature = self._process_single_level(feature, self.attention_modules[idx])
+            outputs.append(enhanced_feature)
+            
+        return outputs if len(outputs) > 1 else outputs[0]

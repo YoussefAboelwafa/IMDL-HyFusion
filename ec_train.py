@@ -45,6 +45,8 @@ def edge_loss(pred, target, weights=None):
 import warnings
 warnings.filterwarnings("ignore", message="libpng warning: iCCP: known incorrect sRGB profile")
 warnings.filterwarnings("ignore", message="libpng warning: iCCP: profile 'ICC profile': 'bTRC': ICC profile tag start not a multiple of 4")
+warnings.filterwarnings("ignore", message="Corrupt EXIF data", module="PIL.TiffImagePlugin")
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL.Image")
 pretty_errors.configure(
     separator_character='*',
     filename_display=pretty_errors.FILENAME_EXTENDED,
@@ -123,12 +125,21 @@ if __name__ == '__main__':
                     train=False)
 
     logging.info(train.get_info())
-    train_loader = DataLoader(train,
-                            batch_size=config.BATCH_SIZE,
-                            shuffle=True,
-                            num_workers=config.WORKERS,
-                            pin_memory=True)
+    def worker_init_fn(worker_id):
+        # Set different seed for each worker
+        np.random.seed(np.random.get_state()[1][0] + worker_id)
 
+    # Modify DataLoader initialization
+    train_loader = DataLoader(
+        train,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.WORKERS,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True,  # Keep workers alive between epochs
+        drop_last=True  # Prevent irregular batch sizes
+    )
     val_loader = DataLoader(val,
                             batch_size=1,
                             shuffle=False,
@@ -188,6 +199,9 @@ if __name__ == '__main__':
         start_epoch = 0
     def train_epoch(epoch, model, modal_extractor, train_loader, criterion, optimizer, scaler, writer, device, config):
         """Run one training epoch"""
+        # Clear cache at start of epoch
+        torch.cuda.empty_cache()
+        
         model.set_train()
         if args.train_bayar:
             modal_extractor.set_train()
@@ -202,6 +216,7 @@ if __name__ == '__main__':
         for step, (images, name, masks, _) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             masks = masks.squeeze(1).to(device, non_blocking=True)
+            # del name  # Free memory if not needed
             
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 modals = modal_extractor(images)
@@ -255,25 +270,30 @@ if __name__ == '__main__':
                 optimizer, mode='min', factor=0.1, patience=5
             )
             # Add gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2)
             # Add proper weight decay
-            # config.WD = 0.0001
             scaler.scale(loss).backward()
             if config.WD > 0:
                 for param in model.parameters():
                     if param.grad is not None:
-                        param.grad.data.add_(config.WD, param.data)
-
+                        param.grad.data.add_(param.data, alpha=config.WD)
             if ((step + 1) % config.ACCUMULATE_ITERS == 0) or (step + 1 == len(train_loader)):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                
+                # Clear cache periodically
+                if step % 100 == 0:
+                    torch.cuda.empty_cache()
+            
+            
 
             avg_loss.update(loss.detach().item())
             edge_loss_avg.update(edge_loss_val.detach().item())
 
             curr_iters = epoch * iters_per_epoch + step
-            lr_schedule.step(cur_iter=curr_iters)
+            # lr_schedule.step(cur_iter=curr_iters)
+            scheduler.step(loss.detach().item())
             wandb.log({
                     "train/step_loss": loss.detach().item(),
                     "train/edge_loss": edge_loss_val.detach().item(),
@@ -291,13 +311,20 @@ if __name__ == '__main__':
                                 epoch)
 
             pbar.set_postfix({"last_loss": loss.detach().item(), "epoch_loss": avg_loss.average()})
-        
+            # Clear intermediate tensors
+            del pred
+            del edge
+            del sem_map
+            del loss
+            torch.cuda.empty_cache()
+            gc.collect()
         writer.add_scalar('Training Loss', avg_loss.average(), epoch)
         wandb.log({
             "train/epoch_loss": avg_loss.average(),
             "train/epoch_edge_loss": edge_loss_avg.average(),
             "epoch": epoch
         })
+
         return avg_loss.average()
 
     def validate_epoch(epoch, model, modal_extractor, val_loader, criterion, writer, device, config):
@@ -306,7 +333,7 @@ if __name__ == '__main__':
         modal_extractor.set_val()
         
         val_loss_avg = AverageMeter()
-        edge_val_loss_avg = AverageMeter()
+        # edge_val_loss_avg = AverageMeter()
         f1 = []
         f1th = []
         
@@ -338,6 +365,17 @@ if __name__ == '__main__':
                 F1_best, F1_th = computeLocalizationMetrics(map, gt)
                 f1.append(F1_best)
                 f1th.append(F1_th)
+                del images
+                del masks
+                del modals
+                del images_norm
+                del pred
+                del edge
+                del sem_map
+                del val_loss
+                gc.collect()
+                if step % 50 == 0:
+                    torch.cuda.empty_cache()
 
         writer.add_scalar('Val Loss', val_loss_avg.average(), epoch)
         writer.add_scalar('Val F1 best', np.nanmean(f1), epoch)

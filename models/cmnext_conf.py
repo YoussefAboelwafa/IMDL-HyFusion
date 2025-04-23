@@ -30,6 +30,9 @@ class CMNeXtWithConf(BaseModel):
         # Initialize heads
         self.decode_head = SegFormerHead(channels, hidden_dim, num_classes)
         self.conf_head = SegFormerHead(channels, hidden_dim, 1)
+
+        # Dual attention head
+        self.da_head = DAHead(in_channels=channels, nclass = num_classes)
         
         # Edge detection branch
         self.edge_branch = ESB(2, sobel=True)
@@ -136,17 +139,18 @@ class CMNeXtWithConf(BaseModel):
           
           # Apply 1x1 conv to match original channel dimensions
           if idx == 0:
-              enhanced_feat = self.adjust_channels_1(enhanced_feat)  # Output channels: 64
+              enhanced_feat = self.adjust_layers[0](enhanced_feat)  # Output channels: 64
           elif idx == 1:
-              enhanced_feat = self.adjust_channels_2(enhanced_feat)  # Output channels: 128
+              enhanced_feat = self.adjust_layers[1](enhanced_feat)  # Output channels: 128
           elif idx == 2:
-              enhanced_feat = self.adjust_channels_3(enhanced_feat)  # Output channels: 320
+              enhanced_feat = self.adjust_layers[2](enhanced_feat)  # Output channels: 320
           else:
-              enhanced_feat = self.adjust_channels_4(enhanced_feat)  # Output channels: 512
+              enhanced_feat = self.adjust_layers[3](enhanced_feat)  # Output channels: 512
               
           enhanced_features.append(enhanced_feat)
 
       # Pass through decode head
+    #   enhanced_features = self.da_head(enhanced_features)
       out = self.decode_head(enhanced_features)
       out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 

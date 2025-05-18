@@ -42,9 +42,22 @@ def edge_loss(pred, target, weights=None):
     loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights, reduction='mean')
     return loss
 
+def append_to_log_file(text, file_path="log.txt"):
+    """Append text to a log file. Create the file if it doesn't exist."""
+    if not os.path.exists(file_path):
+        with open(file_path, "w") as f:
+            f.write("")  # Create an empty file if it doesn't exist
+    with open(file_path, "a") as f:
+        f.write(text + "\n")
+
+# set seed for all random number generators
+torch.cuda.manual_seed(2920002)
+torch.cuda.manual_seed_all(2920002)
+torch.manual_seed(2920002)
+np.random.seed(2920002)
+
 import warnings
-warnings.filterwarnings("ignore", message="libpng warning: iCCP: known incorrect sRGB profile")
-warnings.filterwarnings("ignore", message="libpng warning: iCCP: profile 'ICC profile': 'bTRC': ICC profile tag start not a multiple of 4")
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL.PngImagePlugin")
 pretty_errors.configure(
     separator_character='*',
     filename_display=pretty_errors.FILENAME_EXTENDED,
@@ -58,7 +71,9 @@ pretty_errors.configure(
     display_locals=True
 )
 if __name__ == '__main__':
-    
+    if not os.path.exists("log.txt"):
+        with open("log.txt", "w") as f:
+            f.write("")  # Create an empty file if it doesn't exist
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('-gpu', '--gpu', type=int, default=0, help='device, use -1 for cpu')
     parser.add_argument('-log', '--log', type=str, default='INFO', help='logging level')
@@ -163,11 +178,17 @@ if __name__ == '__main__':
     max_iters = config.EPOCHS * iters_per_epoch
     min_loss = 100
 
-    lr_schedule = WarmUpPolyLR(optimizer,
-                            start_lr=config.LEARNING_RATE,
-                            lr_power=config.POLY_POWER,
-                            total_iters=max_iters,
-                            warmup_steps=iters_per_epoch * config.WARMUP_EPOCHS)
+    # Choose one scheduler based on your needs
+    if config.SCHEDULER == 'warmup_poly':
+        scheduler = WarmUpPolyLR(optimizer,
+                                start_lr=config.LEARNING_RATE,
+                                lr_power=config.POLY_POWER,
+                                total_iters=max_iters,
+                                warmup_steps=iters_per_epoch * config.WARMUP_EPOCHS)
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.1, patience=3
+            )
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -194,6 +215,7 @@ if __name__ == '__main__':
         
         avg_loss = AverageMeter()
         edge_loss_avg = AverageMeter()
+        mask_loss_avg = AverageMeter()
         iters_per_epoch = len(train_loader)
         
         pbar = tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
@@ -215,6 +237,7 @@ if __name__ == '__main__':
                 
                 edge_loss_val = edge_loss(edge, edge_gt)
                 loss = criterion(pred, masks) / config.ACCUMULATE_ITERS
+                mask_loss = loss
                 loss += edge_loss_val * config.EDGE_LOSS_WEIGHT
 
                 if (step + 1) % SAVE_FREQ == 0:
@@ -251,9 +274,7 @@ if __name__ == '__main__':
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_sem.png'), sem_map_vis)
 
                 
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.1, patience=5
-            )
+          
             # Add gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             # Add proper weight decay
@@ -271,14 +292,23 @@ if __name__ == '__main__':
 
             avg_loss.update(loss.detach().item())
             edge_loss_avg.update(edge_loss_val.detach().item())
+            mask_loss_avg.update(mask_loss.detach().item())
 
             curr_iters = epoch * iters_per_epoch + step
-            lr_schedule.step(cur_iter=curr_iters)
+            if isinstance(scheduler, WarmUpPolyLR):
+                scheduler.step(cur_iter=curr_iters)
+            else:
+                # ReduceLROnPlateau should be called once per epoch, not per step
+                if step + 1 == len(train_loader):  # End of epoch
+                    scheduler.step(avg_loss.average())
             wandb.log({
                     "train/step_loss": loss.detach().item(),
                     "train/edge_loss": edge_loss_val.detach().item(),
+                    "train/mask_loss": mask_loss.detach().item(),
                     "train/learning_rate": optimizer.param_groups[0]['lr']
                 }, step=curr_iters)
+            append_to_log_file(f"Epoch {epoch}, Step {step}, Loss: {loss.item()}, Edge Loss: {edge_loss_val.item()}, Mask Loss: {mask_loss.item()}")
+            append_to_log_file(f"Learning Rate: {optimizer.param_groups[0]['lr']}", "log.txt")
             writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], curr_iters)
 
             if step == 0:
@@ -298,6 +328,7 @@ if __name__ == '__main__':
             "train/epoch_edge_loss": edge_loss_avg.average(),
             "epoch": epoch
         })
+
         return avg_loss.average()
 
     def validate_epoch(epoch, model, modal_extractor, val_loader, criterion, writer, device, config):
@@ -389,6 +420,7 @@ if __name__ == '__main__':
                 "best_f1_fixed": f1_fixed,
                 "best_model_epoch": epoch
             })
+            append_to_log_file(f"Best model saved at epoch {epoch} with val_loss: {val_loss}, f1_best: {f1_best}, f1_fixed: {f1_fixed}", "log.txt")
             wandb.save(save_path)            
         writer.flush()
 

@@ -49,7 +49,7 @@ class _ChannelAttentionModule(nn.Module):
 
 
 class DAHead(nn.Module):
-    def __init__(self, in_channels, nclass, aux=True, norm_layer=nn.BatchNorm2d, norm_kwargs=None, **kwargs):
+    def __init__(self, in_channels, nclass, aux=False, norm_layer=nn.BatchNorm2d, norm_kwargs=None, **kwargs):
         super(DAHead, self).__init__()
         self.aux = aux
         inter_channels = in_channels // 4
@@ -109,5 +109,4 @@ class DAHead(nn.Module):
             outputs.append(p_out)
             outputs.append(c_out)
 
-        return tuple(outputs)
-
+        return outputs

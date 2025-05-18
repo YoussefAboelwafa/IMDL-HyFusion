@@ -6,7 +6,7 @@ import warnings
 import matplotlib.pyplot as plt
 import logging
 
-def get_semantic_map(image, yolo_model_path="yolov8n-seg.pt", mask_threshold=0.5):
+def get_semantic_map(image, yolo_model_path="yolo11x-seg.pt", mask_threshold=0.5):
     """
     Given a batch of input images and a YOLO segmentation model,
     run inference and produce a batch of semantic maps where each pixel is labeled with its class id.
@@ -61,7 +61,6 @@ def get_semantic_map(image, yolo_model_path="yolov8n-seg.pt", mask_threshold=0.5
                 semantic_map[binary_mask_resized.astype(bool)] = cls + 1
         
         # Append the semantic map to the list
-        plt.imshow(semantic_map)
         semantic_maps.append(semantic_map)
     
     # Convert list of semantic maps to numpy array

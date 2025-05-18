@@ -27,7 +27,7 @@ class CMNeXtWithConf(BaseModel):
         self.conf_head = SegFormerHead(self.backbone.channels, 256 if 'B0' in backbone or 'B1' in backbone else 512, 1)
 
         self.edge_branch = ESB(2,sobel=True)
-        self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
+        # self.da_head = DAHead(in_channels=256 if 'B0' in backbone or 'B1' in backbone else 512, nclass=num_classes)
         self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)  # Reduce edge map to 1 channel
         self.adjust_channels_1 = nn.Conv2d(64 + 1 + 1, 64, kernel_size=1)    # Original channels + sem_map + edge_map
         self.adjust_channels_2 = nn.Conv2d(128 + 1 + 1, 128, kernel_size=1)
@@ -54,12 +54,21 @@ class CMNeXtWithConf(BaseModel):
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
+        # Add dropout layers after each feature level
+        # self.dropout1 = nn.Dropout(p=0.1)
+        # self.dropout2 = nn.Dropout(p=0.1)
+        # self.dropout3 = nn.Dropout(p=0.1)
+        # self.dropout4 = nn.Dropout(p=0.1)
+        
+        # Add dropout before decode head
+        self.final_dropout = nn.Dropout(p=0.2)
+
     def set_train(self):
         if self.train_phase == 'localization':
             self.backbone.train()
             self.decode_head.train()
             self.edge_branch.train()
-            self.da_head.train()
+            # self.da_head.train()
         elif self.train_phase == 'detection':
             self.conf_head.train()
             self.detection.train()
@@ -127,7 +136,24 @@ class CMNeXtWithConf(BaseModel):
               
           enhanced_features.append(enhanced_feat)
 
+      # Pass through DA head
+    #   enhanced_features = self.da_head(enhanced_features)
+    
       # Pass through decode head
+    #   for idx, feat in enumerate(enhanced_features):
+    #       if self.training:
+    #           if idx == 0:
+    #               enhanced_features[idx] = self.dropout1(feat)
+    #           elif idx == 1:
+    #               enhanced_features[idx] = self.dropout2(feat)
+    #           elif idx == 2:
+    #               enhanced_features[idx] = self.dropout3(feat)
+    #           else:
+    #               enhanced_features[idx] = self.dropout4(feat)
+    
+      if self.training:
+          enhanced_features = [self.final_dropout(feat) for feat in enhanced_features]
+    
       out = self.decode_head(enhanced_features)
       out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 

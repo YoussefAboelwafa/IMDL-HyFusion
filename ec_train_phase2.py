@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import logging
 import torch
 import torchvision.transforms.functional as TF
-
+import wandb
 
 from data.datasets import MixDataset
 from common.metrics import computeDetectionMetrics
@@ -55,6 +55,21 @@ modal_extractor = ModalitiesExtractor(config.MODEL.MODALS[1:], config.MODEL.NP_W
 model = CMNeXtWithConf(config.MODEL)
 
 ckpt = torch.load(args.ckpt)
+
+# Initialize wandb
+wandb.init(
+    project="mmfusion-phase2",  # You can use a different project name for phase2
+    name=config.MODEL.NAME,    # use model name as run name
+    config={
+        "learning_rate": config.LEARNING_RATE,
+        "architecture": "CMNeXtWithConf-Phase2",
+        "backbone": config.MODEL.BACKBONE,
+        "epochs": config.EPOCHS,
+        "batch_size": config.BATCH_SIZE,
+        "image_size": config.DATASET.IMG_SIZE,
+        "modalities": config.MODEL.MODALS,
+    }
+)
 
 model.load_state_dict(ckpt['state_dict'], strict=False)
 modal_extractor.load_state_dict(ckpt['extractor_state_dict'])
@@ -153,7 +168,19 @@ for epoch in range(config.EPOCHS):
         writer.add_scalar('Total Loss', loss.detach().item(), curr_iters)
         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], curr_iters)
 
+        # Log training metrics to wandb
+        wandb.log({
+            "train/step_loss": loss.detach().item(),
+            "train/learning_rate": optimizer.param_groups[0]['lr']
+        }, step=curr_iters)
+
         pbar.set_postfix({"last_loss": loss.detach().item(), "epoch_loss": avg_loss.average()})
+
+    # Log epoch loss to wandb
+    wandb.log({
+        "train/epoch_loss": avg_loss.average(),
+        "epoch": epoch
+    })
 
     scores = []
     labels = []
@@ -183,14 +210,36 @@ for epoch in range(config.EPOCHS):
     writer.add_scalar('Val Loss', val_loss_avg.average(), epoch)
     writer.add_scalar('Val AUC', auc, epoch)
     writer.add_scalar('Val bACC', baCC, epoch)
+
+    # Log validation metrics to wandb
+    wandb.log({
+        "val/loss": val_loss_avg.average(),
+        "val/auc": auc, 
+        "val/baCC": baCC,
+        "epoch": epoch
+    })
+
     if val_loss_avg.average() < min_loss:
         min_loss = val_loss_avg.average()
         result = {'epoch': epoch, 'val_loss': val_loss_avg.average(),'val_baCC': baCC,
                   'val_auc': auc, 'state_dict': model.state_dict(),
                   'extractor_state_dict': modal_extractor.state_dict()}
-        torch.save(result, './ckpt/{}/best_val_loss.pth'.format(config.MODEL.NAME))
+        save_path = './ckpt/{}/best_val_loss_phs2.pth'.format(config.MODEL.NAME)
+        torch.save(result, save_path)
+        
+        # Log best model to wandb
+        wandb.log({
+            "best_val_loss": val_loss_avg.average(),
+            "best_auc": auc,
+            "best_baCC": baCC,
+            "best_model_epoch": epoch
+        })
+        wandb.save(save_path)
 
 result = {'epoch': config.EPOCHS - 1, 'val_loss': val_loss_avg.average(), 'val_baCC': baCC,
                   'val_auc': auc, 'state_dict': model.state_dict(),
           'extractor_state_dict': modal_extractor.state_dict()}
-torch.save(result, './ckpt/{}/final.pth'.format(config.MODEL.NAME))
+torch.save(result, './ckpt/{}/final_phs2.pth'.format(config.MODEL.NAME))
+
+# Finish wandb logging
+wandb.finish()

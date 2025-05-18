@@ -128,7 +128,17 @@ class ManipulationDataset(Dataset):
             mask = np.zeros((h, w), np.uint8)  # a totally black mask for real image
         else:
             with cwd(self.base_path):
-                mask = cv2.imread(self.mask_paths[index], cv2.IMREAD_GRAYSCALE)
+                if 'FantasticReality' in self.path:
+                    # Load mask as NPZ file
+                    mask_data = np.load(self.mask_paths[index])
+                    # Assuming the mask is stored in the first array or with key 'mask'
+                    # Adjust the key as needed based on your NPZ file structure
+                    # if 'mask' in mask_data:
+                    #     mask = mask_data['mask']
+                    # else:
+                    mask = mask_data['arr_0']  # Default key for first array
+                else:
+                    mask = cv2.imread(self.mask_paths[index], cv2.IMREAD_GRAYSCALE)
 
 
 

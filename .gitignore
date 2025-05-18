@@ -12,3 +12,4 @@ logs/
 ckpt/
 wandb/
 *.log
+*.pt

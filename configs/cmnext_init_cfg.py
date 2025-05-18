@@ -12,6 +12,7 @@ _C.SGD_MOMENTUM = 0.9
 _C.WD = 0.0
 _C.EPOCHS = 100
 _C.WARMUP_EPOCHS = 2
+_C.SCHEDULER = 'warmup_poly'
 _C.POLY_POWER = 0.9
 _C.ACCUMULATE_ITERS = 1
 _C.EDGE_LOSS_WEIGHT = 0.05
@@ -34,6 +35,7 @@ _C.MODEL.DETECTION = None
 _C.MODEL.NUM_CLASSES = 2
 _C.MODEL.TRAIN_PHASE = 'localization'
 _C.MODEL.NP_WEIGHTS = ''
+_C.MODEL.DA_HEAD = False
 
 # Dataset parameters
 _C.DATASET = CN()

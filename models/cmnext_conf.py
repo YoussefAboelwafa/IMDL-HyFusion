@@ -22,53 +22,91 @@ class CMNeXtWithConf(BaseModel):
         logging.info(f'Training phase: {cfg.TRAIN_PHASE}')
         logging.info(f'Loading Model: {cfg.NAME}, backbone: {cfg.BACKBONE}')
         super().__init__(backbone, num_classes, modals)
-        
+
         # Get backbone channels
         channels = self.backbone.channels
         hidden_dim = 256 if 'B0' in backbone or 'B1' in backbone else 512
-        
+
         # Initialize heads
         self.decode_head = SegFormerHead(channels, hidden_dim, num_classes)
         self.conf_head = SegFormerHead(channels, hidden_dim, 1)
 
         # Dual attention head
         self.da_head = DAHead(in_channels=channels, nclass = num_classes)
-        
+
+        # Feature Pyramid Network (FPN) style enhancement
+        self.fpn_convs = nn.ModuleList()
+        self.fpn_laterals = nn.ModuleList()
+
+        # Create lateral connections and output convs for FPN
+        for i, c in enumerate(channels):
+            # Lateral connections (reduce channel dimensions)
+            self.fpn_laterals.append(nn.Conv2d(c, hidden_dim, kernel_size=1))
+
+            # Output convolutions (3x3 conv to smooth features)
+            self.fpn_convs.append(nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True)
+            ))
+
         # Edge detection branch
         self.edge_branch = ESB(2, sobel=True)
         self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)
-        
-        # Channel adjustment layers with BatchNorm and ReLU
-        self.adjust_layers = nn.ModuleList([
-            nn.Sequential(
+
+        # Enhanced feature fusion with residual connections
+        self.adjust_layers = nn.ModuleList()
+        for c in [64, 128, 320, 512]:
+            # Create a more complex fusion module with residual connection
+            fusion_module = nn.Sequential(
+                # First branch: direct 1x1 conv (main path)
                 nn.Conv2d(c + 2, c, kernel_size=1),
                 nn.BatchNorm2d(c),
-                nn.ReLU(inplace=True)
-            ) for c in [64, 128, 320, 512]
-        ])
-        
-        # Detection head
+                nn.ReLU(inplace=True),
+
+                # Second branch: deeper processing
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
+            )
+
+            # Residual connection wrapper
+            residual_fusion = lambda x, module=fusion_module, c=c: module(x) + x[:, :c, :, :]
+
+            self.adjust_layers.append(residual_fusion)
+
+        # Enhanced detection head with more layers and wider dimensions
         if cfg.DETECTION == 'confpool':
             self.detection = nn.Sequential(
-                nn.Linear(8, 128),
+                nn.Linear(8, 256),  # Wider first layer
                 nn.ReLU(inplace=True),
-                nn.Dropout(p=0.5),
+                nn.Dropout(p=0.3),  # Less aggressive dropout
+                nn.BatchNorm1d(256),
+                nn.Linear(256, 256),  # Additional layer
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),
+                nn.BatchNorm1d(256),
+                nn.Linear(256, 128),  # Additional layer
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),
                 nn.BatchNorm1d(128),
                 nn.Linear(128, 1),
                 nn.Sigmoid()
             )
-            
+
         self.train_phase = cfg.TRAIN_PHASE
         assert self.train_phase in ['localization', 'detection']
-        
+
         # Initialize weights and load pretrained
         self.apply(self._init_weights)
         self.init_pretrained(cfg.PRETRAINED, backbone)
-        
+
         # Freeze parameters for detection phase
         if self.train_phase == 'detection':
             self._freeze_localization_params()
-            
+
     def _freeze_localization_params(self):
         """Freeze backbone and localization head parameters"""
         for module in [self.backbone, self.decode_head]:
@@ -104,63 +142,111 @@ class CMNeXtWithConf(BaseModel):
       # get semantic map and convert to float
       sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
       sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
-          
+
       # get edge map
       edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
       edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
       # Reduce edge map channels to 1
       edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
 
+      # Use backbone with gradient checkpointing to save memory
       if masks is not None:
-          y = self.backbone(x, masks)
+          # Use gradient checkpointing for backbone to reduce memory usage
+          def create_custom_forward(module):
+              def custom_forward(*inputs):
+                  return module(*inputs)
+              return custom_forward
+
+          y = checkpoint(create_custom_forward(self.backbone), x, masks)
       else:
-          y = self.backbone(x)  # List of 4 tensors with different scales
-      
+          # Use gradient checkpointing for backbone to reduce memory usage
+          def create_custom_forward(module):
+              def custom_forward(*inputs):
+                  return module(*inputs)
+              return custom_forward
+
+          y = checkpoint(create_custom_forward(self.backbone), x)
+
       # Resize semantic map and edge map to match each feature map scale
       enhanced_features = []
+
+      # Pre-compute sizes for all feature maps to batch process
+      sizes = [feat.shape[2:] for feat in y]
+
+      # Batch resize semantic maps for all feature levels at once
+      sem_maps_resized = [
+          F.interpolate(sem_map, size=size, mode='bilinear', align_corners=False)
+          for size in sizes
+      ]
+
+      # Batch resize edge maps for all feature levels at once
+      edge_maps_resized = [
+          F.interpolate(edge_map, size=size, mode='bilinear', align_corners=False)
+          for size in sizes
+      ]
+
+      # Process each feature level with optimized operations
       for idx, feat in enumerate(y):
-          # Get current feature map size
-          curr_size = feat.shape[2:]  # This will be a tuple (H, W)
-          
-          # Resize semantic map to current scale
-          sem_map_resized = F.interpolate(sem_map, 
-                                        size=curr_size,  # Pass tuple of (H, W)
-                                        mode='bilinear',
-                                        align_corners=False)
-          
-          # Resize edge map to current scale
-          edge_map_resized = F.interpolate(edge_map,
-                                        size=curr_size,  # Pass tuple of (H, W)
-                                        mode='bilinear',
-                                        align_corners=False)
-          
+          # Get pre-computed resized maps
+          sem_map_resized = sem_maps_resized[idx]
+          edge_map_resized = edge_maps_resized[idx]
+
           # Concatenate along channel dimension
           enhanced_feat = torch.cat([feat, sem_map_resized, edge_map_resized], dim=1)
-          
-          # Apply 1x1 conv to match original channel dimensions
-          if idx == 0:
-              enhanced_feat = self.adjust_layers[0](enhanced_feat)  # Output channels: 64
-          elif idx == 1:
-              enhanced_feat = self.adjust_layers[1](enhanced_feat)  # Output channels: 128
-          elif idx == 2:
-              enhanced_feat = self.adjust_layers[2](enhanced_feat)  # Output channels: 320
-          else:
-              enhanced_feat = self.adjust_layers[3](enhanced_feat)  # Output channels: 512
-              
+
+          # Apply enhanced fusion module with residual connection
+          enhanced_feat = self.adjust_layers[idx](enhanced_feat)
+
+          # Apply ReLU after residual connection (use in-place operation for memory efficiency)
+          enhanced_feat = F.relu(enhanced_feat, inplace=True)
+
           enhanced_features.append(enhanced_feat)
 
-      # Pass through decode head
-    #   enhanced_features = self.da_head(enhanced_features)
-      out = self.decode_head(enhanced_features)
+      # Apply dual attention head for enhanced feature extraction
+      enhanced_features = self.da_head(enhanced_features)
+
+      # Apply FPN enhancement for multi-scale feature fusion
+      fpn_features = []
+
+      # Apply lateral connections to reduce channel dimensions
+      laterals = [self.fpn_laterals[i](feat) for i, feat in enumerate(enhanced_features)]
+
+      # Top-down pathway
+      prev_features = laterals[-1]
+      fpn_features.append(self.fpn_convs[-1](prev_features))
+
+      # Process from high to low resolution
+      for i in range(len(laterals) - 2, -1, -1):
+          # Upsample higher level features
+          upsample = F.interpolate(
+              prev_features, 
+              size=laterals[i].shape[2:],
+              mode='bilinear', 
+              align_corners=False
+          )
+
+          # Add lateral connection (skip connection)
+          prev_features = laterals[i] + upsample
+
+          # Apply 3x3 conv to smooth features
+          fpn_out = self.fpn_convs[i](prev_features)
+          fpn_features.insert(0, fpn_out)
+
+      # Pass through decode head with FPN enhanced features
+      out = self.decode_head(fpn_features)
       out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 
       if self.train_phase == 'detection':
-          conf = self.conf_head(enhanced_features)
+          # Use FPN-enhanced features for confidence prediction as well
+          conf = self.conf_head(fpn_features)
           conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+
           from .layer_utils import weighted_statistics_pooling
           f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
           f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
               out.shape[0], -1)
+
+          # Pass through enhanced detection head
           det = self.detection(torch.cat((f1, f2), -1))
           return out, conf, det
 

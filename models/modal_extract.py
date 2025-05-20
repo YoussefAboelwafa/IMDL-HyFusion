@@ -54,11 +54,35 @@ class ModalitiesExtractor(nn.Module):
 
     def forward(self, x) -> list:
         out = []
-        for mod in self.mod_extract:
-            y = mod(x)
-            if y.size()[-3] == 1:
-                y = torch.tile(y, (3, 1, 1))
-            out.append(y)
+
+        # Process modalities in parallel when possible
+        if torch.cuda.is_available() and len(self.mod_extract) > 1:
+            # Create streams for parallel execution
+            streams = [torch.cuda.Stream() for _ in range(len(self.mod_extract))]
+
+            # Process each modality in its own stream
+            for i, mod in enumerate(self.mod_extract):
+                with torch.cuda.stream(streams[i]):
+                    # Use memory-efficient operations
+                    with torch.no_grad() if isinstance(mod, self.noiseprint.__class__) else torch.enable_grad():
+                        y = mod(x)
+                        if y.size()[-3] == 1:
+                            # Use expand instead of tile for better memory efficiency
+                            y = y.expand(-1, 3, -1, -1)
+                        out.append(y)
+
+            # Synchronize all streams
+            torch.cuda.synchronize()
+        else:
+            # Sequential processing for CPU or single modality
+            for mod in self.mod_extract:
+                # Use memory-efficient operations
+                with torch.no_grad() if hasattr(self, 'noiseprint') and mod is self.noiseprint else torch.enable_grad():
+                    y = mod(x)
+                    if y.size()[-3] == 1:
+                        # Use expand instead of tile for better memory efficiency
+                        y = y.expand(-1, 3, -1, -1)
+                    out.append(y)
 
         return out
 

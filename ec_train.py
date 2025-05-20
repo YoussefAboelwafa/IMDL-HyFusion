@@ -1,46 +1,27 @@
 """
 Created by Kostas Triaridis (@kostino)
 in August 2023 @ ITI-CERTH
+Enhanced for better architecture
 """
 import os
 import argparse
 import numpy as np
-from tqdm import tqdm
-from common.utils import AverageMeter
-from common.losses import TruForLoss
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader
 import logging
 import torch
-import torchvision.transforms.functional as TF
-
-from data.datasets import MixDataset
-from common.metrics import computeLocalizationMetrics
-# from common.losses import edge_loss
-from models.cmnext_conf import CMNeXtWithConf
-from common.split_params import group_weight
-from common.lr_schedule import WarmUpPolyLR
-from models.modal_extract import ModalitiesExtractor
-from configs.cmnext_init_cfg import _C as config, update_config
-import pretty_errors
-import cv2
-import os.path as osp
 import gc
 import wandb
-gc.collect()
+import pretty_errors
+from configs.cmnext_init_cfg import _C as config, update_config
+from common.losses import TruForLoss
 
-def edge_loss(pred, target, weights=None):
-    """
-    Binary cross entropy loss for edge detection
-    """
-    if weights is None:
-        weights = torch.ones_like(target)
-    
-    # Apply class weights
-    from torch.nn import functional as F
-    weights = weights.float()
-    loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights, reduction='mean')
-    return loss
+# Import custom modules
+from trainer import Trainer
+from data.data_module import DataModule
+from models.model_module import ModelModule
+from common.optimizer_module import OptimizerModule
+
+# Configure garbage collection
+gc.collect()
 
 import warnings
 warnings.filterwarnings("ignore", message="libpng warning: iCCP: known incorrect sRGB profile")
@@ -59,9 +40,13 @@ pretty_errors.configure(
     truncate_code=True,
     display_locals=True
 )
-if __name__ == '__main__':
-    
-    parser = argparse.ArgumentParser(description='')
+
+def main():
+    """
+    Main training function
+    """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Training script for CMNeXt with confidence')
     parser.add_argument('-gpu', '--gpu', type=int, default=0, help='device, use -1 for cpu')
     parser.add_argument('-log', '--log', type=str, default='INFO', help='logging level')
     parser.add_argument('-train_bayar', '--train_bayar', action='store_true', help='finetune bayar conv')
@@ -70,7 +55,42 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default='', help='Resume from checkpoint path')
     args = parser.parse_args()
 
-    print(torch.cuda.is_available())
+    # Update configuration from experiment file
+    global config
+    config = update_config(config, args.exp)
+
+    # Set up logging
+    loglvl = getattr(logging, args.log.upper())
+    logging.basicConfig(level=loglvl, format='%(message)s')
+
+    # Set up device
+    gpu = args.gpu
+    device = 'cuda:%d' % gpu if gpu >= 0 else 'cpu'
+    np.set_printoptions(formatter={'float': '{: 7.3f}'.format})
+    print(f"Device: {device}")
+    torch.set_flush_denormal(True)
+
+    # Configure CUDA settings
+    if device != 'cpu':
+        import torch.backends.cudnn as cudnn
+        cudnn.benchmark = config.CUDNN.BENCHMARK
+        cudnn.deterministic = config.CUDNN.DETERMINISTIC
+        cudnn.enabled = config.CUDNN.ENABLED
+
+    # Initialize wandb
+    wandb.init(
+        project="mmfusion",  # replace it with your project name
+        name=config.MODEL.NAME,    # use model name as run name
+        config={
+            "learning_rate": config.LEARNING_RATE,
+            "architecture": "CMNeXtWithConf",
+            "backbone": config.MODEL.BACKBONE,
+            "epochs": config.EPOCHS,
+            "batch_size": config.BATCH_SIZE,
+            "image_size": config.DATASET.IMG_SIZE,
+            "modalities": config.MODEL.MODALS,
+        }
+    )
     config = update_config(config, args.exp)
     torch.cuda.empty_cache()
     gpu = args.gpu
@@ -100,7 +120,7 @@ if __name__ == '__main__':
 
     model = CMNeXtWithConf(config.MODEL)
     wandb.init(
-        project="mmfusion",  # replace with your project name
+        project="mmfusion",  # replace it with your project name
         name=config.MODEL.NAME,    # use model name as run name
         config={
             "learning_rate": config.LEARNING_RATE,
@@ -201,33 +221,33 @@ if __name__ == '__main__':
         """Run one training epoch"""
         # Clear cache at start of epoch
         torch.cuda.empty_cache()
-        
+
         model.set_train()
         if args.train_bayar:
             modal_extractor.set_train()
-        
+
         avg_loss = AverageMeter()
         edge_loss_avg = AverageMeter()
         iters_per_epoch = len(train_loader)
-        
+
         pbar = tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
         optimizer.zero_grad(set_to_none=True)
-        
+
         for step, (images, name, masks, _) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             masks = masks.squeeze(1).to(device, non_blocking=True)
             # del name  # Free memory if not needed
-            
+
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 modals = modal_extractor(images)
                 images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                 inp = [images_norm] + modals
-                
+
                 pred, edge, sem_map = model(inp)
-                
+
                 edge_gt = torch.zeros_like(edge)
                 edge_gt[masks == 1] = 1
-                
+
                 edge_loss_val = edge_loss(edge, edge_gt)
                 loss = criterion(pred, masks) / config.ACCUMULATE_ITERS
                 loss += edge_loss_val * config.EDGE_LOSS_WEIGHT
@@ -248,11 +268,11 @@ if __name__ == '__main__':
                         print(f'Saving maps for {img_name}')
                         prob_map = (pred_prob[idx] * 255).astype(np.uint8)
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_prob.png'), prob_map)
-                        
+
                         # Save binary map with threshold 0.5
                         binary_map = (pred_prob[idx] > 0.5).astype(np.uint8) * 255
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_binary.png'), binary_map)
-                        
+
                         # Save edge map
                         edge_map_vis = (edge_prob[idx] * 255).astype(np.uint8)
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_edge.png'), edge_map_vis)
@@ -265,7 +285,7 @@ if __name__ == '__main__':
                         sem_map_vis = (sem_map_np[idx] * 255).astype(np.uint8)
                         cv2.imwrite(osp.join(maps_dir, f'{img_name}_sem.png'), sem_map_vis)
 
-                
+
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='min', factor=0.1, patience=5
             )
@@ -281,12 +301,12 @@ if __name__ == '__main__':
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                
+
                 # Clear cache periodically
                 if step % 100 == 0:
                     torch.cuda.empty_cache()
-            
-            
+
+
 
             avg_loss.update(loss.detach().item())
             edge_loss_avg.update(edge_loss_val.detach().item())
@@ -331,29 +351,29 @@ if __name__ == '__main__':
         """Run one validation epoch"""
         model.set_val()
         modal_extractor.set_val()
-        
+
         val_loss_avg = AverageMeter()
         # edge_val_loss_avg = AverageMeter()
         f1 = []
         f1th = []
-        
+
         pbar = tqdm(val_loader, desc=f'Validating Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
-        
+
         for step, (images, _, masks, lab) in enumerate(pbar):
             with torch.no_grad():
                 images = images.to(device, non_blocking=True)
                 masks = masks.squeeze(1).to(device, non_blocking=True)
-                
+
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     modals = modal_extractor(images)
                     images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                     inp = [images_norm] + modals
-                    
+
                     pred, edge, sem_map = model(inp)
-                    
+
                     # edge_gt = torch.zeros_like(edge)
                     # edge_gt[masks == 1] = 1
-                    
+
                     # edge_loss_val = edge_loss(edge, edge_gt)
                     val_loss = criterion(pred, masks)
 
@@ -404,8 +424,8 @@ if __name__ == '__main__':
         # Validation phase
         val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
                                                     criterion, writer, device, config)
-        
-        
+
+
         # Save best model
         if val_loss < min_loss:
             min_loss = val_loss
@@ -419,7 +439,7 @@ if __name__ == '__main__':
             }
             save_path = f'./ckpt/{config.MODEL.NAME}/best_val_loss.pth'
             torch.save(result, save_path)
-            
+
             # Log best model to wandb
             wandb.log({
                 "best_val_loss": val_loss,

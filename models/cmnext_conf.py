@@ -14,6 +14,19 @@ from models.modules.dual_atten import DAHead
 # 1. Implement gradient checkpointing
 from torch.utils.checkpoint import checkpoint
 
+
+
+class ResidualFusion(nn.Module):
+    """A proper module for residual fusion to replace lambda functions"""
+    def __init__(self, fusion_module, channels):
+        super(ResidualFusion, self).__init__()
+        self.fusion_module = fusion_module
+        self.channels = channels
+    
+    def forward(self, x):
+        return self.fusion_module(x) + x[:, :self.channels, :, :]
+
+
 class CMNeXtWithConf(BaseModel):
     def __init__(self, cfg=None) -> None:
         backbone = cfg.BACKBONE
@@ -60,7 +73,7 @@ class CMNeXtWithConf(BaseModel):
             # Create a more complex fusion module with residual connection
             fusion_module = nn.Sequential(
                 # First branch: direct 1x1 conv (main path)
-                nn.Conv2d(c + 2, c, kernel_size=1),
+                nn.Conv2d(c + 1, c, kernel_size=1),
                 nn.BatchNorm2d(c),
                 nn.ReLU(inplace=True),
 
@@ -73,7 +86,8 @@ class CMNeXtWithConf(BaseModel):
             )
 
             # Residual connection wrapper
-            residual_fusion = lambda x, module=fusion_module, c=c: module(x) + x[:, :c, :, :]
+            
+            residual_fusion = ResidualFusion(fusion_module, c)
 
             self.adjust_layers.append(residual_fusion)
 
@@ -140,117 +154,126 @@ class CMNeXtWithConf(BaseModel):
 
     def forward(self, x: list, masks: list = None):
       # get semantic map and convert to float
-      sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
-      sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
+        # sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
+        # sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
 
       # get edge map
-      edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
-      edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
-      # Reduce edge map channels to 1
-      edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
+        edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
+        edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
+        # Reduce edge map channels to 1
+        edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
 
       # Use backbone with gradient checkpointing to save memory
-      if masks is not None:
-          # Use gradient checkpointing for backbone to reduce memory usage
-          def create_custom_forward(module):
-              def custom_forward(*inputs):
-                  return module(*inputs)
-              return custom_forward
+    #   if masks is not None:
+    #       # Use gradient checkpointing for backbone to reduce memory usage
+    #       def create_custom_forward(module):
+    #           def custom_forward(*inputs):
+    #               return module(*inputs)
+    #           return custom_forward
 
-          y = checkpoint(create_custom_forward(self.backbone), x, masks)
-      else:
-          # Use gradient checkpointing for backbone to reduce memory usage
-          def create_custom_forward(module):
-              def custom_forward(*inputs):
-                  return module(*inputs)
-              return custom_forward
+    #       y = checkpoint(create_custom_forward(self.backbone), x, masks)
+    #   else:
+    #       # Use gradient checkpointing for backbone to reduce memory usage
+    #       def create_custom_forward(module):
+    #           def custom_forward(*inputs):
+    #               return module(*inputs)
+    #           return custom_forward
 
-          y = checkpoint(create_custom_forward(self.backbone), x)
+    #       y = checkpoint(create_custom_forward(self.backbone), x)
+        if masks is not None:
+            y = self.backbone(x,masks)
+        else:
+            y = self.backbone(x)
 
       # Resize semantic map and edge map to match each feature map scale
-      enhanced_features = []
+        enhanced_features = []
 
-      # Pre-compute sizes for all feature maps to batch process
-      sizes = [feat.shape[2:] for feat in y]
+        # Pre-compute sizes for all feature maps to batch process
+        sizes = [feat.shape[2:] for feat in y]
 
-      # Batch resize semantic maps for all feature levels at once
-      sem_maps_resized = [
-          F.interpolate(sem_map, size=size, mode='bilinear', align_corners=False)
-          for size in sizes
-      ]
+        # Batch resize semantic maps for all feature levels at once
+        # sem_maps_resized = [
+        #     F.interpolate(sem_map, size=size, mode='bilinear', align_corners=False)
+        #     for size in sizes
+        # ]
 
-      # Batch resize edge maps for all feature levels at once
-      edge_maps_resized = [
-          F.interpolate(edge_map, size=size, mode='bilinear', align_corners=False)
-          for size in sizes
-      ]
+        # Batch resize edge maps for all feature levels at once
+        edge_maps_resized = [
+            F.interpolate(edge_map, size=size, mode='bilinear', align_corners=False)
+            for size in sizes
+        ]
 
-      # Process each feature level with optimized operations
-      for idx, feat in enumerate(y):
-          # Get pre-computed resized maps
-          sem_map_resized = sem_maps_resized[idx]
-          edge_map_resized = edge_maps_resized[idx]
+        # Process each feature level with optimized operations
+        for idx, feat in enumerate(y):
+            # Get pre-computed resized maps
+            # sem_map_resized = sem_maps_resized[idx]
+            edge_map_resized = edge_maps_resized[idx]
 
-          # Concatenate along channel dimension
-          enhanced_feat = torch.cat([feat, sem_map_resized, edge_map_resized], dim=1)
+            # Concatenate along channel dimension
+            enhanced_feat = torch.cat([feat, edge_map_resized], dim=1)
 
-          # Apply enhanced fusion module with residual connection
-          enhanced_feat = self.adjust_layers[idx](enhanced_feat)
+            # Apply enhanced fusion module with residual connection
+            enhanced_feat = self.adjust_layers[idx](enhanced_feat)
 
-          # Apply ReLU after residual connection (use in-place operation for memory efficiency)
-          enhanced_feat = F.relu(enhanced_feat, inplace=True)
+            # Apply ReLU after residual connection (use in-place operation for memory efficiency)
+            enhanced_feat = F.relu(enhanced_feat, inplace=True)
 
-          enhanced_features.append(enhanced_feat)
+            enhanced_features.append(enhanced_feat)
 
-      # Apply dual attention head for enhanced feature extraction
-      enhanced_features = self.da_head(enhanced_features)
+        # Apply dual attention head for enhanced feature extraction
+        enhanced_features = self.da_head(enhanced_features)
 
-      # Apply FPN enhancement for multi-scale feature fusion
-      fpn_features = []
+        # Apply FPN enhancement for multi-scale feature fusion
+        fpn_features = []
 
-      # Apply lateral connections to reduce channel dimensions
-      laterals = [self.fpn_laterals[i](feat) for i, feat in enumerate(enhanced_features)]
+        # Apply lateral connections to reduce channel dimensions
+        laterals = [self.fpn_laterals[i](feat) for i, feat in enumerate(enhanced_features)]
 
-      # Top-down pathway
-      prev_features = laterals[-1]
-      fpn_features.append(self.fpn_convs[-1](prev_features))
+        # Top-down pathway
+        prev_features = laterals[-1]
+        fpn_features.append(self.fpn_convs[-1](prev_features))
 
-      # Process from high to low resolution
-      for i in range(len(laterals) - 2, -1, -1):
-          # Upsample higher level features
-          upsample = F.interpolate(
-              prev_features, 
-              size=laterals[i].shape[2:],
-              mode='bilinear', 
-              align_corners=False
-          )
+        # Process from high to low resolution
+        for i in range(len(laterals) - 2, -1, -1):
+            # Upsample higher level features
+            upsample = F.interpolate(
+                prev_features, 
+                size=laterals[i].shape[2:],
+                mode='bilinear', 
+                align_corners=False
+            )
 
-          # Add lateral connection (skip connection)
-          prev_features = laterals[i] + upsample
+            # Add lateral connection (skip connection)
+            prev_features = laterals[i] + upsample
 
-          # Apply 3x3 conv to smooth features
-          fpn_out = self.fpn_convs[i](prev_features)
-          fpn_features.insert(0, fpn_out)
+            # Apply 3x3 conv to smooth features
+            fpn_out = self.fpn_convs[i](prev_features)
+            fpn_features.insert(0, fpn_out)
+        # Now fpn_features contains enhanced features at multiple scales
 
-      # Pass through decode head with FPN enhanced features
-      out = self.decode_head(fpn_features)
-      out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+        # print feature shapes
+        for idx, feat in enumerate(fpn_features):
+            print(f"FPN feature {idx} shape: {feat.shape}")
 
-      if self.train_phase == 'detection':
-          # Use FPN-enhanced features for confidence prediction as well
-          conf = self.conf_head(fpn_features)
-          conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+        # Pass through decode head with FPN enhanced features
+        out = self.decode_head(fpn_features)
+        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 
-          from .layer_utils import weighted_statistics_pooling
-          f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
-          f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
-              out.shape[0], -1)
+        if self.train_phase == 'detection':
+            # Use FPN-enhanced features for confidence prediction as well
+            conf = self.conf_head(fpn_features)
+            conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 
-          # Pass through enhanced detection head
-          det = self.detection(torch.cat((f1, f2), -1))
-          return out, conf, det
+            from .layer_utils import weighted_statistics_pooling
+            f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
+            f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
+                out.shape[0], -1)
 
-      return out, edges, sem_map
+            # Pass through enhanced detection head
+            det = self.detection(torch.cat((f1, f2), -1))
+            return out, conf, det
+
+        return out, edges 
 
 
     def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:

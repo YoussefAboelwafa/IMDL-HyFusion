@@ -86,6 +86,18 @@ class ModalitiesExtractor(nn.Module):
 
         return out
 
+    def to(self, device):
+        super().to(device)
+        for mod in self.mod_extract:
+            mod.to(device)
+        if hasattr(self, 'bayar'):
+            self.bayar.to(device)
+        if hasattr(self, 'srm'):
+            self.srm.to(device)
+        if hasattr(self, 'noiseprint'):
+            self.noiseprint.to(device)
+        return self
+
 
 if __name__ == '__main__':
     modal_ext = ModalitiesExtractor(['noiseprint', 'bayar', 'srm'], '../pretrained/noiseprint/np++.pth')

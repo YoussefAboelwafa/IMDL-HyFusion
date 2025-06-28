@@ -12,6 +12,8 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from contextlib import contextmanager
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 @contextmanager
 def cwd(path):
@@ -87,7 +89,13 @@ class ManipulationDataset(Dataset):
                 except ValueError:
                     print("Incorrect amount of columns in file, expected 4")
                     print(parts)
-
+                # remove "./" from first of image path and mask path
+                image_path = image_path.lstrip('./')
+                mask_path = mask_path.lstrip('./')
+                if not os.path.isabs(image_path):
+                    image_path = os.path.join(BASE_DIR, image_path)
+                if not os.path.isabs(mask_path):
+                    mask_path = os.path.join(BASE_DIR, mask_path)
                 self.image_paths.append(image_path)
                 self.mask_paths.append(mask_path)
                 self.labels.append(int(label_str))
@@ -136,8 +144,8 @@ class ManipulationDataset(Dataset):
             res = self.image_transforms_train(image=image, mask=mask)
             image = res['image']
             mask = res['mask']
-        elif h > 2048 or w > 2048:
-            res = A.LongestMaxSize(max_size=2048)(image=image, mask=mask)
+        elif h > 1024 or w > 1024:
+            res = A.LongestMaxSize(max_size=1024)(image=image, mask=mask)
             image = res['image']
             mask = res['mask']
 

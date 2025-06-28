@@ -44,7 +44,7 @@ class ModelModule:
         # Load pretrained weights for bayar if available
         if 'bayar' in self.config.MODEL.MODALS:
             self.modal_extractor.load_state_dict(
-                torch.load('pretrained/modal_extractor/bayar_mhsa.pth', map_location=torch.device('cpu')), 
+                torch.load('pretrained/pretrained/modal_extractor/bayar_mhsa.pth', map_location=torch.device('cpu')), 
                 strict=False
             )
             if not self.train_bayar:

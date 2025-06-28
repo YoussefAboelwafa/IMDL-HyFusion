@@ -144,6 +144,7 @@ def main():
     parser.add_argument('-exp', '--exp', type=str, default=None, help='Yaml experiment file')
     parser.add_argument('opts', help="other options", default=None, nargs=argparse.REMAINDER)
     parser.add_argument('--ckpt', type=str, default='', help='Resume from checkpoint path')
+    parser.add_argument('--model_pretrained', type=str, default='', help='Path to pretrained model weights')
     args = parser.parse_args()
 
     # Update configuration from experiment file
@@ -265,6 +266,10 @@ def main():
 
     # Load checkpoint if provided
     start_epoch = 0
+
+    if args.model_pretrained and os.path.exists(args.model_pretrained):
+        model.load_training_checkpoint(args.model_pretrained,modal_extractor=modal_extractor, optimizer=optimizer, scaler=scaler,lr_schedule=lr_schedule, map_location=device)
+
     if args.ckpt and os.path.exists(args.ckpt):
         logger.info(f'Loading checkpoint from {args.ckpt}')
         ckpt = torch.load(args.ckpt, map_location=device)

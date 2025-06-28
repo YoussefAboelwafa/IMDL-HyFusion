@@ -2,9 +2,11 @@
 Created by Kostas Triaridis (@kostino)
 in August 2023 @ ITI-CERTH
 """
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.init import trunc_normal_
 from models.base import BaseModel
 from models.heads import SegFormerHead
 import logging
@@ -58,8 +60,8 @@ class CMNeXtWithConf(BaseModel):
 
             # Output convolutions (3x3 conv to smooth features)
             self.fpn_convs.append(nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-                nn.BatchNorm2d(hidden_dim),
+                nn.Conv2d(hidden_dim, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
                 nn.ReLU(inplace=True)
             ))
 
@@ -249,12 +251,6 @@ class CMNeXtWithConf(BaseModel):
             # Apply 3x3 conv to smooth features
             fpn_out = self.fpn_convs[i](prev_features)
             fpn_features.insert(0, fpn_out)
-        # Now fpn_features contains enhanced features at multiple scales
-
-        # print feature shapes
-        for idx, feat in enumerate(fpn_features):
-            print(f"FPN feature {idx} shape: {feat.shape}")
-
         # Pass through decode head with FPN enhanced features
         out = self.decode_head(fpn_features)
         out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
@@ -273,7 +269,7 @@ class CMNeXtWithConf(BaseModel):
             det = self.detection(torch.cat((f1, f2), -1))
             return out, conf, det
 
-        return out, edges 
+        return out, edges , None
 
 
     def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:
@@ -282,14 +278,340 @@ class CMNeXtWithConf(BaseModel):
             if self.backbone.num_modals > 0:
                 load_dualpath_model(self.backbone, pretrained, backbone)
             else:
-                checkpoint = torch.load(pretrained, map_location='cpu')
-                if 'state_dict' in checkpoint.keys():
-                    checkpoint = checkpoint['state_dict']
-                if 'model' in checkpoint.keys():
-                    checkpoint = checkpoint['model']
-                msg = self.backbone.load_state_dict(checkpoint, strict=False)
-                print(msg)
+                try:
+                    # Try to load as a full model checkpoint first
+                    result = self.load_checkpoint(pretrained, strict=False)
+                    logging.info(f"Loaded pretrained model: {len(result['loaded_keys'])} parameters loaded, "
+                               f"{len(result['missing_keys'])} missing, {len(result['unexpected_keys'])} unexpected")
+                except Exception as e:
+                    # Fallback to loading only backbone
+                    logging.warning(f"Failed to load as full model checkpoint: {e}. Trying backbone only...")
+                    checkpoint = torch.load(pretrained, map_location='cpu')
+                    if 'state_dict' in checkpoint.keys():
+                        checkpoint = checkpoint['state_dict']
+                    if 'model' in checkpoint.keys():
+                        checkpoint = checkpoint['model']
+                    msg = self.backbone.load_state_dict(checkpoint, strict=False)
+                    print(msg)
 
+    def load_checkpoint(self, checkpoint_path: str, strict: bool = False, map_location='cpu'):
+        """
+        Load checkpoint with all available components and initialize weights for remaining components.
+        
+        Args:
+            checkpoint_path (str): Path to the checkpoint file
+            strict (bool): Whether to strictly enforce that the keys in checkpoint match the keys in model
+            map_location: Device to map the checkpoint to
+            
+        Returns:
+            dict: Loading information including missing and unexpected keys
+        """
+        logging.info(f'Loading checkpoint from: {checkpoint_path}')
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        
+        # Handle different checkpoint formats
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+        
+        # Get current model state dict
+        model_state_dict = self.state_dict()
+        
+        # Track loading statistics
+        loaded_keys = []
+        missing_keys = []
+        unexpected_keys = []
+        size_mismatched_keys = []
+        
+        # Create a new state dict with only compatible keys
+        compatible_state_dict = {}
+        
+        for key, param in state_dict.items():
+            if key in model_state_dict:
+                if param.shape == model_state_dict[key].shape:
+                    compatible_state_dict[key] = param
+                    loaded_keys.append(key)
+                else:
+                    size_mismatched_keys.append(f"{key}: checkpoint {param.shape} vs model {model_state_dict[key].shape}")
+                    logging.warning(f"Size mismatch for {key}: checkpoint {param.shape} vs model {model_state_dict[key].shape}")
+            else:
+                unexpected_keys.append(key)
+        
+        # Find missing keys
+        for key in model_state_dict.keys():
+            if key not in compatible_state_dict:
+                missing_keys.append(key)
+        
+        # Load compatible weights
+        loading_result = self.load_state_dict(compatible_state_dict, strict=False)
+        
+        # Initialize weights for missing components
+        if missing_keys:
+            logging.info(f"Initializing weights for {len(missing_keys)} missing components...")
+            
+            # Create a temporary model to get properly initialized weights
+            for key in missing_keys:
+                module_names = key.split('.')
+                module = self
+                
+                # Navigate to the parent module
+                for name in module_names[:-1]:
+                    if hasattr(module, name):
+                        module = getattr(module, name)
+                    else:
+                        break
+                else:
+                    # Get the parameter name
+                    param_name = module_names[-1]
+                    if hasattr(module, param_name):
+                        param = getattr(module, param_name)
+                        if isinstance(param, nn.Parameter):
+                            # Initialize the parameter based on its type
+                            if len(param.shape) >= 2:  # Weight matrix
+                                if 'weight' in param_name:
+                                    if len(param.shape) == 2:  # Linear layer
+                                        nn.init.trunc_normal_(param, std=0.02)
+                                    else:  # Conv layer
+                                        nn.init.kaiming_normal_(param)
+                                elif 'bias' in param_name:
+                                    nn.init.zeros_(param)
+                            else:  # Bias or 1D parameter
+                                if 'weight' in param_name:
+                                    nn.init.ones_(param)
+                                else:
+                                    nn.init.zeros_(param)
+                        
+                            logging.debug(f"Initialized {key} with shape {param.shape}")
+        
+        # Log loading summary
+        logging.info(f"Checkpoint loading summary:")
+        logging.info(f"  - Loaded: {len(loaded_keys)} parameters")
+        logging.info(f"  - Missing: {len(missing_keys)} parameters")
+        logging.info(f"  - Unexpected: {len(unexpected_keys)} parameters")
+        logging.info(f"  - Size mismatched: {len(size_mismatched_keys)} parameters")
+        
+        if missing_keys and len(missing_keys) <= 20:  # Show details if not too many
+            logging.info(f"Missing keys: {missing_keys}")
+        elif missing_keys:
+            logging.info(f"Missing keys (showing first 20): {missing_keys[:20]}")
+            
+        if unexpected_keys and len(unexpected_keys) <= 20:
+            logging.info(f"Unexpected keys: {unexpected_keys}")
+        elif unexpected_keys:
+            logging.info(f"Unexpected keys (showing first 20): {unexpected_keys[:20]}")
+            
+        if size_mismatched_keys:
+            logging.warning(f"Size mismatched keys: {size_mismatched_keys}")
+        
+        # Return comprehensive loading information
+        return {
+            'loaded_keys': loaded_keys,
+            'missing_keys': missing_keys,
+            'unexpected_keys': unexpected_keys,
+            'size_mismatched_keys': size_mismatched_keys,
+            'loading_result': loading_result,
+            'checkpoint_info': {k: v for k, v in checkpoint.items() if k != 'state_dict' and k != 'model'}
+        }
+
+    def load_training_checkpoint(self, checkpoint_path: str, modal_extractor=None, optimizer=None, scaler=None, lr_schedule=None, map_location='cpu'):
+        """
+        Load a training checkpoint with model, modal_extractor, optimizer, and other training components.
+        
+        Args:
+            checkpoint_path (str): Path to the training checkpoint file
+            modal_extractor: Modal extractor model to load state into
+            optimizer: Optimizer to load state into
+            scaler: GradScaler to load state into  
+            lr_schedule: Learning rate scheduler to load state into
+            map_location: Device to map the checkpoint to
+            
+        Returns:
+            dict: Checkpoint information including epoch, losses, and loading results
+        """
+        logging.info(f'Loading training checkpoint from: {checkpoint_path}')
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        
+        results = {}
+        
+        # Load model state dict
+        if 'state_dict' in checkpoint:
+            model_result = self.load_checkpoint_state_dict(checkpoint['state_dict'])
+            results['model_loading'] = model_result
+            logging.info("Model state dict loaded successfully")
+        else:
+            logging.warning("No 'state_dict' found in checkpoint")
+        
+        # Load modal extractor state dict
+        if modal_extractor is not None and 'extractor_state_dict' in checkpoint:
+            try:
+                extractor_result = modal_extractor.load_state_dict(checkpoint['extractor_state_dict'], strict=False)
+                results['extractor_loading'] = extractor_result
+                logging.info("Modal extractor state dict loaded successfully")
+            except Exception as e:
+                logging.error(f"Failed to load modal extractor state dict: {e}")
+                results['extractor_loading'] = {'error': str(e)}
+        elif modal_extractor is not None:
+            logging.warning("Modal extractor provided but no 'extractor_state_dict' found in checkpoint")
+        
+        # Load optimizer state dict
+        if optimizer is not None and 'optimizer' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                results['optimizer_loaded'] = True
+                logging.info("Optimizer state dict loaded successfully")
+            except Exception as e:
+                logging.error(f"Failed to load optimizer state dict: {e}")
+                results['optimizer_loaded'] = False
+                results['optimizer_error'] = str(e)
+        elif optimizer is not None:
+            logging.warning("Optimizer provided but no 'optimizer' found in checkpoint")
+        
+        # Load scaler state dict
+        if scaler is not None and 'scaler' in checkpoint:
+            try:
+                scaler.load_state_dict(checkpoint['scaler'])
+                results['scaler_loaded'] = True
+                logging.info("Scaler state dict loaded successfully")
+            except Exception as e:
+                logging.error(f"Failed to load scaler state dict: {e}")
+                results['scaler_loaded'] = False
+                results['scaler_error'] = str(e)
+        elif scaler is not None:
+            logging.warning("Scaler provided but no 'scaler' found in checkpoint")
+        
+        # Load learning rate schedule state
+        if lr_schedule is not None and 'lr_schedule' in checkpoint:
+            try:
+                # Update lr_schedule attributes from checkpoint
+                lr_schedule.__dict__.update(checkpoint['lr_schedule'])
+                results['lr_schedule_loaded'] = True
+                logging.info("Learning rate schedule state loaded successfully")
+            except Exception as e:
+                logging.error(f"Failed to load learning rate schedule state: {e}")
+                results['lr_schedule_loaded'] = False
+                results['lr_schedule_error'] = str(e)
+        elif lr_schedule is not None:
+            logging.warning("Learning rate schedule provided but no 'lr_schedule' found in checkpoint")
+        
+        # Extract training metadata
+        training_info = {}
+        for key in ['epoch', 'train_loss', 'val_loss', 'val_f1_best', 'val_f1_fixed']:
+            if key in checkpoint:
+                training_info[key] = checkpoint[key]
+        
+        results['training_info'] = training_info
+        results['config'] = checkpoint.get('config', None)
+        
+        # Log training info
+        if training_info:
+            logging.info(f"Training checkpoint info: {training_info}")
+        
+        return results
+
+    def load_checkpoint_state_dict(self, state_dict, strict=False):
+        """
+        Load only the model state dict with intelligent handling of missing/extra keys.
+        
+        Args:
+            state_dict: State dictionary to load
+            strict: Whether to strictly match keys
+            
+        Returns:
+            dict: Loading result information
+        """
+        # Get current model state dict
+        model_state_dict = self.state_dict()
+        
+        # Track loading statistics
+        loaded_keys = []
+        missing_keys = []
+        unexpected_keys = []
+        size_mismatched_keys = []
+        
+        # Create a new state dict with only compatible keys
+        compatible_state_dict = {}
+        
+        for key, param in state_dict.items():
+            if key in model_state_dict:
+                if param.shape == model_state_dict[key].shape:
+                    compatible_state_dict[key] = param
+                    loaded_keys.append(key)
+                else:
+                    size_mismatched_keys.append(f"{key}: checkpoint {param.shape} vs model {model_state_dict[key].shape}")
+            else:
+                unexpected_keys.append(key)
+        
+        # Find missing keys
+        for key in model_state_dict.keys():
+            if key not in compatible_state_dict:
+                missing_keys.append(key)
+        
+        # Load compatible weights
+        loading_result = self.load_state_dict(compatible_state_dict, strict=False)
+        
+        # Initialize missing components if any
+        if missing_keys:
+            self._initialize_missing_components(missing_keys)
+        
+        return {
+            'loaded_keys': loaded_keys,
+            'missing_keys': missing_keys,
+            'unexpected_keys': unexpected_keys,
+            'size_mismatched_keys': size_mismatched_keys,
+            'loading_result': loading_result
+        }
+
+    def _initialize_missing_components(self, missing_keys):
+        """Initialize weights for missing components"""
+        logging.info(f"Initializing weights for {len(missing_keys)} missing components...")
+        
+        # Group missing keys by module
+        modules_to_init = set()
+        for key in missing_keys:
+            module_path = '.'.join(key.split('.')[:-1])
+            if module_path:
+                modules_to_init.add(module_path)
+        
+        # Initialize each module
+        for module_path in modules_to_init:
+            module = self
+            try:
+                for name in module_path.split('.'):
+                    module = getattr(module, name)
+                
+                # Apply weight initialization to the module
+                module.apply(self._initialize_module_weights)
+                logging.debug(f"Initialized module: {module_path}")
+                
+            except AttributeError:
+                logging.warning(f"Could not find module: {module_path}")
+
+    def _initialize_module_weights(self, module: nn.Module):
+        """
+        Initialize weights for a specific module using the same strategy as _init_weights
+        """
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.BatchNorm1d)):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+            if hasattr(module, 'eps'):
+                module.eps = 0.001
+            if hasattr(module, 'momentum'):
+                module.momentum = 0.1
 
 def load_dualpath_model(model, model_file, backbone):
     extra_pretrained = model_file if 'MHSA' in backbone else None
@@ -354,3 +676,4 @@ if __name__ == '__main__':
          torch.ones(1, 3, 1024, 1024) * 3]
     y = model(x)
     print(y.shape)
+    

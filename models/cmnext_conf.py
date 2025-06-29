@@ -155,61 +155,44 @@ class CMNeXtWithConf(BaseModel):
             raise ValueError(f'Train phase {self.train_phase} not recognized!')
 
     def forward(self, x: list, masks: list = None):
-      # get semantic map and convert to float
-        # sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
-        # sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
-
-      # get edge map
+        # Memory optimization: Use gradient checkpointing during training, disable during inference
+        use_checkpointing = self.training and hasattr(self, 'use_gradient_checkpointing') and self.use_gradient_checkpointing
+        
+        # get edge map with memory optimization
         edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
         edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
         # Reduce edge map channels to 1
         edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
 
-      # Use backbone with gradient checkpointing to save memory
-    #   if masks is not None:
-    #       # Use gradient checkpointing for backbone to reduce memory usage
-    #       def create_custom_forward(module):
-    #           def custom_forward(*inputs):
-    #               return module(*inputs)
-    #           return custom_forward
+        # Use backbone with optional gradient checkpointing
+        if use_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
 
-    #       y = checkpoint(create_custom_forward(self.backbone), x, masks)
-    #   else:
-    #       # Use gradient checkpointing for backbone to reduce memory usage
-    #       def create_custom_forward(module):
-    #           def custom_forward(*inputs):
-    #               return module(*inputs)
-    #           return custom_forward
-
-    #       y = checkpoint(create_custom_forward(self.backbone), x)
-        if masks is not None:
-            y = self.backbone(x,masks)
+            if masks is not None:
+                y = checkpoint(create_custom_forward(self.backbone), x, masks)
+            else:
+                y = checkpoint(create_custom_forward(self.backbone), x)
         else:
-            y = self.backbone(x)
+            if masks is not None:
+                y = self.backbone(x, masks)
+            else:
+                y = self.backbone(x)
 
-      # Resize semantic map and edge map to match each feature map scale
+        # Memory-efficient feature processing
         enhanced_features = []
-
-        # Pre-compute sizes for all feature maps to batch process
-        sizes = [feat.shape[2:] for feat in y]
-
-        # Batch resize semantic maps for all feature levels at once
-        # sem_maps_resized = [
-        #     F.interpolate(sem_map, size=size, mode='bilinear', align_corners=False)
-        #     for size in sizes
-        # ]
-
-        # Batch resize edge maps for all feature levels at once
-        edge_maps_resized = [
-            F.interpolate(edge_map, size=size, mode='bilinear', align_corners=False)
-            for size in sizes
-        ]
-
-        # Process each feature level with optimized operations
+        
+        # Process features one at a time to reduce peak memory usage
         for idx, feat in enumerate(y):
-            # Get pre-computed resized maps
-            # sem_map_resized = sem_maps_resized[idx]
-            edge_map_resized = edge_maps_resized[idx]
+            # Resize edge map on-demand to save memory
+            edge_map_resized = F.interpolate(
+                edge_map, 
+                size=feat.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
 
             # Concatenate along channel dimension
             enhanced_feat = torch.cat([feat, edge_map_resized], dim=1)
@@ -221,21 +204,38 @@ class CMNeXtWithConf(BaseModel):
             enhanced_feat = F.relu(enhanced_feat, inplace=True)
 
             enhanced_features.append(enhanced_feat)
+            
+            # Clean up intermediate tensors
+            del edge_map_resized, feat
+            if idx < len(y) - 1:  # Don't delete on last iteration as we still need it
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Clean up backbone features to free memory
+        del y
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         # Apply dual attention head for enhanced feature extraction
         enhanced_features = self.da_head(enhanced_features)
 
-        # Apply FPN enhancement for multi-scale feature fusion
+        # Memory-efficient FPN processing
         fpn_features = []
 
-        # Apply lateral connections to reduce channel dimensions
-        laterals = [self.fpn_laterals[i](feat) for i, feat in enumerate(enhanced_features)]
+        # Process laterals one at a time to reduce memory
+        laterals = []
+        for i, feat in enumerate(enhanced_features):
+            lateral = self.fpn_laterals[i](feat)
+            laterals.append(lateral)
 
-        # Top-down pathway
+        # Clean up enhanced features after lateral processing
+        del enhanced_features
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Top-down pathway with memory optimization
         prev_features = laterals[-1]
-        fpn_features.append(self.fpn_convs[-1](prev_features))
+        fpn_out = self.fpn_convs[-1](prev_features)
+        fpn_features.append(fpn_out)
 
-        # Process from high to low resolution
+        # Process from high to low resolution with immediate cleanup
         for i in range(len(laterals) - 2, -1, -1):
             # Upsample higher level features
             upsample = F.interpolate(
@@ -247,10 +247,20 @@ class CMNeXtWithConf(BaseModel):
 
             # Add lateral connection (skip connection)
             prev_features = laterals[i] + upsample
+            
+            # Clean up upsample tensor immediately
+            del upsample
 
             # Apply 3x3 conv to smooth features
             fpn_out = self.fpn_convs[i](prev_features)
             fpn_features.insert(0, fpn_out)
+            
+            # Clean up lateral tensor after use
+            del laterals[i]
+
+        # Clean up remaining tensors
+        del laterals
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         # Pass through decode head with FPN enhanced features
         out = self.decode_head(fpn_features)
         out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
@@ -260,6 +270,10 @@ class CMNeXtWithConf(BaseModel):
             conf = self.conf_head(fpn_features)
             conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
 
+            # Clean up fpn_features after use
+            del fpn_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
             from .layer_utils import weighted_statistics_pooling
             f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
             f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
@@ -267,9 +281,17 @@ class CMNeXtWithConf(BaseModel):
 
             # Pass through enhanced detection head
             det = self.detection(torch.cat((f1, f2), -1))
+            
+            # Clean up intermediate tensors
+            del f1, f2
+            
             return out, conf, det
+        else:
+            # Clean up fpn_features after use in localization phase
+            del fpn_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-        return out, edges , None
+        return out, edges, None
 
 
     def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:
@@ -613,6 +635,179 @@ class CMNeXtWithConf(BaseModel):
             if hasattr(module, 'momentum'):
                 module.momentum = 0.1
 
+    def enable_gradient_checkpointing(self, enable=True):
+        """Enable or disable gradient checkpointing for memory efficiency during training"""
+        self.use_gradient_checkpointing = enable
+        logging.info(f"Gradient checkpointing {'enabled' if enable else 'disabled'}")
+
+    def set_inference_mode(self, enable=True):
+        """
+        Set inference mode for maximum memory efficiency.
+        This will disable gradient computation and optimize for inference.
+        """
+        if enable:
+            self.eval()
+            torch.set_grad_enabled(False)
+            logging.info("Inference mode enabled - gradients disabled for memory efficiency")
+        else:
+            torch.set_grad_enabled(True)
+            logging.info("Inference mode disabled - gradients enabled")
+
+    @torch.no_grad()
+    def forward_inference(self, x: list, masks: list = None, tile_size=None, overlap=0.1):
+        """
+        Memory-efficient inference with optional tiling for very large images.
+        
+        Args:
+            x: Input images list
+            masks: Optional masks
+            tile_size: If provided, split input into tiles of this size for processing
+            overlap: Overlap ratio between tiles (0.0 to 1.0)
+        
+        Returns:
+            Model outputs with reduced memory footprint
+        """
+        original_training = self.training
+        self.eval()
+        
+        try:
+            if tile_size is not None:
+                return self._forward_with_tiling(x, masks, tile_size, overlap)
+            else:
+                return self._forward_with_memory_optimization(x, masks)
+        finally:
+            self.train(original_training)
+
+    def _forward_with_memory_optimization(self, x: list, masks: list = None):
+        """Forward pass with aggressive memory optimization"""
+        # Process with torch.no_grad for inference
+        with torch.no_grad():
+            # Get edge map with immediate cleanup
+            edges, edge_map = self.edge_branch(x[0])
+            edge_map = edge_map.squeeze(2)
+            edge_map = self.edge_channel_reduce(edge_map)
+            
+            # Clear edge computation intermediates
+            del edges  # Don't need edges output for inference
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # Backbone forward
+            if masks is not None:
+                y = self.backbone(x, masks)
+            else:
+                y = self.backbone(x)
+
+            # Process features with minimal memory footprint
+            enhanced_features = []
+            
+            for idx, feat in enumerate(y):
+                # Process one feature at a time
+                edge_resized = F.interpolate(
+                    edge_map, size=feat.shape[2:], mode='bilinear', align_corners=False
+                )
+                enhanced_feat = torch.cat([feat, edge_resized], dim=1)
+                enhanced_feat = self.adjust_layers[idx](enhanced_feat)
+                enhanced_feat = F.relu(enhanced_feat, inplace=True)
+                enhanced_features.append(enhanced_feat)
+                
+                # Immediate cleanup
+                del edge_resized, feat
+                
+            del y, edge_map  # Clean up backbone outputs
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # DA head processing
+            enhanced_features = self.da_head(enhanced_features)
+
+            # FPN with memory optimization
+            fpn_features = self._process_fpn_memory_efficient(enhanced_features)
+            del enhanced_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # Final prediction
+            out = self.decode_head(fpn_features)
+            out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+
+            if self.train_phase == 'detection':
+                conf = self.conf_head(fpn_features)
+                conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+                del fpn_features
+                
+                from .layer_utils import weighted_statistics_pooling
+                f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
+                f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
+                    out.shape[0], -1)
+                det = self.detection(torch.cat((f1, f2), -1))
+                del f1, f2
+                
+                return out, conf, det
+            else:
+                del fpn_features
+                return out, None, None
+
+    def _process_fpn_memory_efficient(self, enhanced_features):
+        """Process FPN with minimal memory usage"""
+        fpn_features = []
+        laterals = []
+        
+        # Process laterals one by one
+        for i, feat in enumerate(enhanced_features):
+            lateral = self.fpn_laterals[i](feat)
+            laterals.append(lateral)
+
+        # Top-down processing with immediate cleanup
+        prev_features = laterals[-1]
+        fpn_out = self.fpn_convs[-1](prev_features)
+        fpn_features.append(fpn_out)
+
+        for i in range(len(laterals) - 2, -1, -1):
+            upsample = F.interpolate(
+                prev_features, size=laterals[i].shape[2:], mode='bilinear', align_corners=False
+            )
+            prev_features = laterals[i] + upsample
+            del upsample, laterals[i]  # Immediate cleanup
+            
+            fpn_out = self.fpn_convs[i](prev_features)
+            fpn_features.insert(0, fpn_out)
+
+        del laterals
+        return fpn_features
+
+    def _forward_with_tiling(self, x: list, masks: list = None, tile_size=512, overlap=0.1):
+        """
+        Process very large images by splitting into tiles.
+        Useful for high-resolution inference when memory is limited.
+        """
+        # This is a placeholder for tiled inference implementation
+        # For now, fall back to regular forward
+        logging.warning("Tiled inference not yet implemented, using regular forward")
+        return self._forward_with_memory_optimization(x, masks)
+
+    def get_memory_usage(self):
+        """Get current GPU memory usage if available"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            cached = torch.cuda.memory_reserved() / 1024**3  # GB
+            return f"GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB"
+        else:
+            return "CUDA not available"
+
+    def optimize_for_inference(self):
+        """Apply various optimizations for inference"""
+        self.eval()
+        
+        # Fuse batch norm layers if possible
+        try:
+            torch.jit.optimize_for_inference(self)
+            logging.info("JIT optimization applied")
+        except:
+            logging.warning("JIT optimization failed, continuing without it")
+        
+        # Set to inference mode
+        self.set_inference_mode(True)
+        
+        logging.info("Model optimized for inference")
+
 def load_dualpath_model(model, model_file, backbone):
     extra_pretrained = model_file if 'MHSA' in backbone else None
     if isinstance(extra_pretrained, str):
@@ -676,4 +871,3 @@ if __name__ == '__main__':
          torch.ones(1, 3, 1024, 1024) * 3]
     y = model(x)
     print(y.shape)
-    

@@ -1,42 +1,50 @@
 """
 Created by Kostas Triaridis (@kostino)
 in August 2023 @ ITI-CERTH
-Enhanced for better architecture
-
-This script implements a modular architecture for training the CMNeXt model with confidence.
-It separates concerns into different modules:
-- Trainer: Handles the training and validation process
-- DataModule: Manages dataset loading and preparation
-- ModelModule: Handles model initialization and configuration
-- OptimizerModule: Manages optimization strategy
-
-See ARCHITECTURE.md for more details on the architectural improvements.
 """
 import os
 import argparse
 import numpy as np
+from tqdm import tqdm
+from common.utils import AverageMeter
+from common.losses import TruForLoss
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 import logging
 import torch
+import torchvision.transforms.functional as TF
+
+from data.datasets import MixDataset
+from common.metrics import computeLocalizationMetrics
+# from common.losses import edge_loss
+from models.cmnext_conf_old import CMNeXtWithConf
+from common.split_params import group_weight
+from common.lr_schedule import WarmUpPolyLR
+from models.modal_extract import ModalitiesExtractor
+from configs.cmnext_init_cfg import _C as config, update_config
+import pretty_errors
+import cv2
+import os.path as osp
 import gc
 import wandb
-import pretty_errors
-from configs.cmnext_init_cfg import _C as config, update_config
-from common.losses import TruForLoss
-
-# Import custom modules
-from trainer import Trainer
-from data.data_module import DataModule
-from models.model_module import ModelModule
-from common.optimizer_module import OptimizerModule
-
-# Configure garbage collection
 gc.collect()
+
+def edge_loss(pred, target, weights=None):
+    """
+    Binary cross entropy loss for edge detection
+    """
+    if weights is None:
+        weights = torch.ones_like(target)
+    
+    # Apply class weights
+    from torch.nn import functional as F
+    weights = weights.float()
+    loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights, reduction='mean')
+    return loss
 
 import warnings
 warnings.filterwarnings("ignore", message="libpng warning: iCCP: known incorrect sRGB profile")
 warnings.filterwarnings("ignore", message="libpng warning: iCCP: profile 'ICC profile': 'bTRC': ICC profile tag start not a multiple of 4")
-warnings.filterwarnings("ignore", message="Corrupt EXIF data", module="PIL.TiffImagePlugin")
-warnings.filterwarnings("ignore", category=UserWarning, module="PIL.Image")
 pretty_errors.configure(
     separator_character='*',
     filename_display=pretty_errors.FILENAME_EXTENDED,
@@ -49,13 +57,9 @@ pretty_errors.configure(
     truncate_code=True,
     display_locals=True
 )
-
-def main():
-    """
-    Main training function
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Training script for CMNeXt with confidence')
+if __name__ == '__main__':
+    
+    parser = argparse.ArgumentParser(description='')
     parser.add_argument('-gpu', '--gpu', type=int, default=0, help='device, use -1 for cpu')
     parser.add_argument('-log', '--log', type=str, default='INFO', help='logging level')
     parser.add_argument('-train_bayar', '--train_bayar', action='store_true', help='finetune bayar conv')
@@ -64,31 +68,37 @@ def main():
     parser.add_argument('--ckpt', type=str, default='', help='Resume from checkpoint path')
     args = parser.parse_args()
 
-    # Update configuration from experiment file
-    global config
+    print(torch.cuda.is_available())
     config = update_config(config, args.exp)
-
-    # Set up logging
+    torch.cuda.empty_cache()
+    gpu = args.gpu
     loglvl = getattr(logging, args.log.upper())
     logging.basicConfig(level=loglvl, format='%(message)s')
 
-    # Set up device
-    gpu = args.gpu
     device = 'cuda:%d' % gpu if gpu >= 0 else 'cpu'
     np.set_printoptions(formatter={'float': '{: 7.3f}'.format})
     print(f"Device: {device}")
     torch.set_flush_denormal(True)
-
-    # Configure CUDA settings
     if device != 'cpu':
+        # cudnn setting
         import torch.backends.cudnn as cudnn
+
         cudnn.benchmark = config.CUDNN.BENCHMARK
         cudnn.deterministic = config.CUDNN.DETERMINISTIC
         cudnn.enabled = config.CUDNN.ENABLED
 
-    # Initialize wandb
+
+    modal_extractor = ModalitiesExtractor(config.MODEL.MODALS[1:], config.MODEL.NP_WEIGHTS)
+    if 'bayar' in config.MODEL.MODALS:
+        modal_extractor.load_state_dict(torch.load('pretrained/modal_extractor/bayar_mhsa.pth',map_location=torch.device('cpu')), strict=False)
+        if not args.train_bayar:
+            modal_extractor.bayar.eval()
+            for param in modal_extractor.bayar.parameters():
+                param.requires_grad = False
+
+    model = CMNeXtWithConf(config.MODEL)
     wandb.init(
-        project="mmfusion",  # replace it with your project name
+        project="mmfusion",  # replace with your project name
         name=config.MODEL.NAME,    # use model name as run name
         config={
             "learning_rate": config.LEARNING_RATE,
@@ -100,63 +110,295 @@ def main():
             "modalities": config.MODEL.MODALS,
         }
     )
+    modal_extractor.to(device)
+    model = model.to(device)
 
-    # Initialize model module
-    model_module = ModelModule(config, device, train_bayar=args.train_bayar)
-    model, modal_extractor = model_module.setup()
+    train = MixDataset(config.DATASET.TRAIN,
+                    config.DATASET.IMG_SIZE,
+                    train=True,
+                    class_weight=config.DATASET.CLASS_WEIGHTS)
 
-    # Initialize data module
-    data_module = DataModule(config)
-    train_loader, val_loader, class_weights = data_module.setup()
+    val = MixDataset(config.DATASET.VAL,
+                    config.DATASET.IMG_SIZE,
+                    train=False)
 
-    # Initialize criterion
-    criterion = TruForLoss(weights=class_weights.to(device), ignore_index=-1)
+    logging.info(train.get_info())
+    train_loader = DataLoader(train,
+                            batch_size=config.BATCH_SIZE,
+                            shuffle=True,
+                            num_workers=config.WORKERS,
+                            pin_memory=True)
 
-    # Initialize optimizer module
-    optimizer_module = OptimizerModule(config)
-    optimizer, lr_scheduler, scaler = optimizer_module.setup(model, modal_extractor)
+    val_loader = DataLoader(val,
+                            batch_size=1,
+                            shuffle=False,
+                            num_workers=config.WORKERS,
+                            pin_memory=True)
 
-    # Update optimizer module with actual iterations per epoch
+    criterion = TruForLoss(weights=train.class_weights.to(device), ignore_index=-1)
+
+    os.makedirs('./ckpt/{}'.format(config.MODEL.NAME), exist_ok=True)
+    logdir = './{}/{}'.format(config.LOG_DIR, config.MODEL.NAME)
+    os.makedirs(logdir, exist_ok=True)
+    writer = SummaryWriter('./{}/{}'.format(config.LOG_DIR, config.MODEL.NAME))
+
+    params = []
+    cmnext_params = []
+    modal_extract_params = []
+    cmnext_params = group_weight(cmnext_params, model, torch.nn.BatchNorm2d, config.LEARNING_RATE)
+    modal_extract_params = group_weight(modal_extract_params, modal_extractor, torch.nn.BatchNorm2d, config.LEARNING_RATE)
+
+    params.append(dict(params=cmnext_params[0]['params'] + modal_extract_params[0]['params'], lr=config.LEARNING_RATE))
+    params.append(dict(params=cmnext_params[1]['params'] + modal_extract_params[1]['params'], weight_decay=.0,
+                    lr=config.LEARNING_RATE))
+
+    optimizer = torch.optim.SGD(params,
+                                lr=config.LEARNING_RATE,
+                                momentum=config.SGD_MOMENTUM,
+                                weight_decay=config.WD
+                                )
+
     iters_per_epoch = len(train_loader)
-    optimizer_module.update_iters_per_epoch(iters_per_epoch)
+    iters = 0
+    max_iters = config.EPOCHS * iters_per_epoch
+    min_loss = 100
 
-    # Initialize trainer
-    trainer = Trainer(
-        model=model,
-        modal_extractor=modal_extractor,
-        criterion=criterion,
-        optimizer=optimizer,
-        scaler=scaler,
-        config=config,
-        device=device,
-        train_bayar=args.train_bayar
-    )
+    lr_schedule = WarmUpPolyLR(optimizer,
+                            start_lr=config.LEARNING_RATE,
+                            lr_power=config.POLY_POWER,
+                            total_iters=max_iters,
+                            warmup_steps=iters_per_epoch * config.WARMUP_EPOCHS)
 
-    # Load checkpoint if provided
-    start_epoch = model_module.load_checkpoint(args.ckpt)
+    scaler = torch.cuda.amp.GradScaler()
 
-    # Training loop
-    min_loss = float('inf')
+    del params
+    del cmnext_params
+    del modal_extract_params
+    gc.collect()
+    torch.cuda.empty_cache()
+    SAVE_FREQ = 100
+
+    if args.ckpt and os.path.exists(args.ckpt):
+        logging.info(f'Loading checkpoint from {args.ckpt}')
+        ckpt = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        modal_extractor.load_state_dict(ckpt['extractor_state_dict']) 
+        start_epoch = ckpt['epoch'] + 1
+    else:
+        start_epoch = 0
+    def train_epoch(epoch, model, modal_extractor, train_loader, criterion, optimizer, scaler, writer, device, config):
+        """Run one training epoch"""
+        model.set_train()
+        if args.train_bayar:
+            modal_extractor.set_train()
+        
+        avg_loss = AverageMeter()
+        edge_loss_avg = AverageMeter()
+        iters_per_epoch = len(train_loader)
+        
+        pbar = tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
+        optimizer.zero_grad(set_to_none=True)
+        
+        for step, (images, name, masks, _) in enumerate(pbar):
+            images = images.to(device, non_blocking=True)
+            masks = masks.squeeze(1).to(device, non_blocking=True)
+            
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                modals = modal_extractor(images)
+                images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                inp = [images_norm] + modals
+                
+                pred, edge, sem_map = model(inp)
+                
+                edge_gt = torch.zeros_like(edge)
+                edge_gt[masks == 1] = 1
+                
+                edge_loss_val = edge_loss(edge, edge_gt)
+                loss = criterion(pred, masks) / config.ACCUMULATE_ITERS
+                loss += edge_loss_val * config.EDGE_LOSS_WEIGHT
+
+                if (step + 1) % SAVE_FREQ == 0:
+                    maps_dir = osp.join('./outputs', config.MODEL.NAME, f'step_{step}')
+                    os.makedirs(maps_dir, exist_ok=True)
+
+                    # Convert predictions to numpy and process for visualization
+                    pred_softmax = torch.nn.functional.softmax(pred, dim=1)
+                    pred_prob = pred_softmax[:, 1, :, :].cpu().detach().numpy()  # Get probability for class 1
+                    edge_prob = torch.sigmoid(edge).cpu().detach().numpy()
+                    sem_map_np = sem_map.cpu().detach().numpy()
+
+                    # Save prediction maps for each image in batch
+                    for idx, img_name in enumerate(name):
+                        # Save probability map
+                        print(f'Saving maps for {img_name}')
+                        prob_map = (pred_prob[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_prob.png'), prob_map)
+                        
+                        # Save binary map with threshold 0.5
+                        binary_map = (pred_prob[idx] > 0.5).astype(np.uint8) * 255
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_binary.png'), binary_map)
+                        
+                        # Save edge map
+                        edge_map_vis = (edge_prob[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_edge.png'), edge_map_vis)
+
+                        # Save ground truth
+                        gt = (masks[idx].cpu().numpy() * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_gt.png'), gt)
+
+                        # Save semantic map
+                        sem_map_vis = (sem_map_np[idx] * 255).astype(np.uint8)
+                        cv2.imwrite(osp.join(maps_dir, f'{img_name}_sem.png'), sem_map_vis)
+
+                
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.1, patience=5
+            )
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Add proper weight decay
+            # config.WD = 0.0001
+            scaler.scale(loss).backward()
+            if config.WD > 0:
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.data.add_(config.WD, param.data)
+
+            if ((step + 1) % config.ACCUMULATE_ITERS == 0) or (step + 1 == len(train_loader)):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            avg_loss.update(loss.detach().item())
+            edge_loss_avg.update(edge_loss_val.detach().item())
+
+            curr_iters = epoch * iters_per_epoch + step
+            lr_schedule.step(cur_iter=curr_iters)
+            wandb.log({
+                    "train/step_loss": loss.detach().item(),
+                    "train/edge_loss": edge_loss_val.detach().item(),
+                    "train/learning_rate": optimizer.param_groups[0]['lr']
+                }, step=curr_iters)
+            writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], curr_iters)
+
+            if step == 0:
+                maps = torch.nn.functional.softmax(pred, dim=1)[:, 1, :, :]
+                writer.add_images('Images-Masks-Preds',
+                                torch.cat((
+                                    images,
+                                    torch.tile(masks.unsqueeze(1), (1, 3, 1, 1)),
+                                    torch.tile(maps.unsqueeze(1), (1, 3, 1, 1))), -2),
+                                epoch)
+
+            pbar.set_postfix({"last_loss": loss.detach().item(), "epoch_loss": avg_loss.average()})
+        
+        writer.add_scalar('Training Loss', avg_loss.average(), epoch)
+        wandb.log({
+            "train/epoch_loss": avg_loss.average(),
+            "train/epoch_edge_loss": edge_loss_avg.average(),
+            "epoch": epoch
+        })
+        return avg_loss.average()
+
+    def validate_epoch(epoch, model, modal_extractor, val_loader, criterion, writer, device, config):
+        """Run one validation epoch"""
+        model.set_val()
+        modal_extractor.set_val()
+        
+        val_loss_avg = AverageMeter()
+        edge_val_loss_avg = AverageMeter()
+        f1 = []
+        f1th = []
+        
+        pbar = tqdm(val_loader, desc=f'Validating Epoch {epoch + 1}/{config.EPOCHS}', unit='steps')
+        
+        for step, (images, _, masks, lab) in enumerate(pbar):
+            with torch.no_grad():
+                images = images.to(device, non_blocking=True)
+                masks = masks.squeeze(1).to(device, non_blocking=True)
+                
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    modals = modal_extractor(images)
+                    images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                    inp = [images_norm] + modals
+                    
+                    pred, edge, sem_map = model(inp)
+                    
+                    # edge_gt = torch.zeros_like(edge)
+                    # edge_gt[masks == 1] = 1
+                    
+                    # edge_loss_val = edge_loss(edge, edge_gt)
+                    val_loss = criterion(pred, masks)
+
+                val_loss_avg.update(val_loss.detach().item())
+                # edge_val_loss_avg.update(edge_loss_val.detach().item())
+
+                gt = masks.squeeze().cpu().numpy()
+                map = torch.nn.functional.softmax(pred, dim=1)[:, 1, :, :].squeeze().cpu().numpy()
+                F1_best, F1_th = computeLocalizationMetrics(map, gt)
+                f1.append(F1_best)
+                f1th.append(F1_th)
+
+        writer.add_scalar('Val Loss', val_loss_avg.average(), epoch)
+        writer.add_scalar('Val F1 best', np.nanmean(f1), epoch)
+        writer.add_scalar('Val F1 fixed', np.nanmean(f1th), epoch)
+        metrics = {
+            "val/loss": val_loss_avg.average(),
+            "val/f1_best": np.nanmean(f1),
+            "val/f1_fixed": np.nanmean(f1th),
+            "epoch": epoch
+        }
+        wandb.log(metrics)
+        return val_loss_avg.average(), np.nanmean(f1), np.nanmean(f1th)
+
+    # Replace the training loop with:
+    min_loss = 100
     for epoch in range(start_epoch, config.EPOCHS):
-        # Shuffle dataset for balanced sampling
-        data_module.shuffle_train_dataset()
+        train.shuffle()  # for balanced sampling
 
+
+        # # Validation phase
+        # val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
+        #                                             criterion, writer, device, config)
         # Training phase
-        train_loss = trainer.train_epoch(epoch, train_loader)
-
+        train_loss = train_epoch(epoch, model, modal_extractor, train_loader, criterion, 
+                                optimizer, scaler, writer, device, config)
         # Validation phase
-        val_loss, f1_best, f1_fixed = trainer.validate_epoch(epoch, val_loader)
-
+        val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
+                                                    criterion, writer, device, config)
+        
+        
         # Save best model
         if val_loss < min_loss:
             min_loss = val_loss
-            trainer.save_checkpoint(epoch, val_loss, f1_best, f1_fixed, is_best=True)
+            result = {
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'val_f1_best': f1_best,
+                'val_f1_fixed': f1_fixed,
+                'state_dict': model.state_dict(),
+                'extractor_state_dict': modal_extractor.state_dict()
+            }
+            save_path = f'./ckpt/{config.MODEL.NAME}/best_val_loss.pth'
+            torch.save(result, save_path)
+            
+            # Log best model to wandb
+            wandb.log({
+                "best_val_loss": val_loss,
+                "best_f1_best": f1_best,
+                "best_f1_fixed": f1_fixed,
+                "best_model_epoch": epoch
+            })
+            wandb.save(save_path)            
+        writer.flush()
 
     # Save final model
-    trainer.save_final_model(config.EPOCHS - 1)
-
-    # Close wandb
-    wandb.finish()
-
-if __name__ == '__main__':
-    main()
+    result = {
+        'epoch': config.EPOCHS - 1,
+        'val_loss': val_loss,
+        'val_f1_best': f1_best,
+        'val_f1_fixed': f1_fixed,
+        'state_dict': model.state_dict(),
+        'extractor_state_dict': modal_extractor.state_dict()
+    }
+    torch.save(result, f'./ckpt/{config.MODEL.NAME}/final.pth')

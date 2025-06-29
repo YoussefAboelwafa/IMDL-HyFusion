@@ -90,12 +90,12 @@ class ManipulationDataset(Dataset):
                     print("Incorrect amount of columns in file, expected 4")
                     print(parts)
                 # remove "./" from first of image path and mask path
-                image_path = image_path.lstrip('./')
-                mask_path = mask_path.lstrip('./')
-                if not os.path.isabs(image_path):
-                    image_path = os.path.join(BASE_DIR, image_path)
-                if not os.path.isabs(mask_path):
-                    mask_path = os.path.join(BASE_DIR, mask_path)
+                # image_path = image_path.lstrip('./')
+                # mask_path = mask_path.lstrip('./')
+                # if not os.path.isabs(image_path):
+                #     image_path = os.path.join(BASE_DIR, image_path)
+                # if not os.path.isabs(mask_path):
+                #     mask_path = os.path.join(BASE_DIR, mask_path)
                 self.image_paths.append(image_path)
                 self.mask_paths.append(mask_path)
                 self.labels.append(int(label_str))

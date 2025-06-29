@@ -255,7 +255,7 @@ def main():
                             total_iters=max_iters,
                             warmup_steps=iters_per_epoch * config.WARMUP_EPOCHS)
 
-    scaler = torch.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler()
 
     # Cleanup
     del params
@@ -400,6 +400,9 @@ def main():
                 masks = masks.squeeze(1).to(device, non_blocking=True)
 
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    if any(torch.isnan(t).any() for t in images):
+                        logging.error("Images contain NaN values!")
+                        raise ValueError("Images contain NaN values")
                     modals = modal_extractor(images)
                     images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                     inp = [images_norm] + modals
@@ -424,7 +427,7 @@ def main():
                 f1th.append(F1_th)
                 
                 # Clear memory
-                del images, masks, modals, images_norm, pred, edge, val_loss
+                del images, masks, modals, images_norm, pred, edge
                 gc.collect()
                 if step % 50 == 0:
                     torch.cuda.empty_cache()

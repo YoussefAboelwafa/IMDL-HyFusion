@@ -106,7 +106,10 @@ class ManipulationDataset(Dataset):
             A.RandomCrop(height=self.image_size, width=self.image_size, p=1),
             A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
         ])
-
+        self.image_transforms_val = A.Compose([
+            A.PadIfNeeded(min_height=self.image_size, min_width=self.image_size, border_mode=cv2.BORDER_CONSTANT, value=127, mask_value=-1, p=1),
+            A.RandomCrop(height=self.image_size, width=self.image_size, p=1),
+        ])
         self.image_transforms_final = A.Compose([
             ToTensorV2()
         ])
@@ -116,7 +119,23 @@ class ManipulationDataset(Dataset):
         # Read image and label
         # ----------
         with cwd(self.base_path):
-            image = cv2.cvtColor(cv2.imread(self.image_paths[index]), cv2.COLOR_BGR2RGB)
+            import time
+
+            def robust_imread(path, retries=3, delay=0.1):
+                for i in range(retries):
+                    img = cv2.imread(path)
+                    if img is not None:
+                        return img
+                    time.sleep(delay)
+                print(f"Failed to read image after {retries} attempts: {path}")
+                return None
+
+            # Usage in your __getitem__:
+            image_path = self.image_paths[index]
+            image = robust_imread(image_path)
+            if image is None:
+                raise FileNotFoundError(f"Image not found or cannot be opened: {image_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         h, w, c = image.shape
         label = self.labels[index]
@@ -136,8 +155,8 @@ class ManipulationDataset(Dataset):
             res = self.image_transforms_train(image=image, mask=mask)
             image = res['image']
             mask = res['mask']
-        elif h > 2048 or w > 2048:
-            res = A.LongestMaxSize(max_size=2048)(image=image, mask=mask)
+        elif h > 1024 or w > 1024:
+            res = A.LongestMaxSize(max_size=1024)(image=image, mask=mask)
             image = res['image']
             mask = res['mask']
 
@@ -178,6 +197,11 @@ class MixDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset_list) * self.smallest
+        # if self.train:
+            # return len(self.dataset_list) * self.smallest
+        #     return len(self.dataset_list) * 2  # for balanced sampling
+        # else:
+        #     return len(self.dataset_list) * self.smallest 
 
     def get_info(self):
         s = "Using datasets:\n"

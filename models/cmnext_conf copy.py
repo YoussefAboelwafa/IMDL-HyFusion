@@ -1,0 +1,377 @@
+"""
+Created by Kostas Triaridis (@kostino)
+in August 2023 @ ITI-CERTH
+"""
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from models.base import BaseModel
+from models.heads import SegFormerHead
+import logging
+from models.modules.esb import ESB
+from models.modules.segmentation import get_semantic_map
+from models.modules.dual_atten import DAHead
+# 1. Implement gradient checkpointing
+from torch.utils.checkpoint import checkpoint
+
+class CMNeXtWithConf(BaseModel):
+    def __init__(self, cfg=None) -> None:
+        backbone = cfg.BACKBONE
+        num_classes = cfg.NUM_CLASSES
+        modals = cfg.MODALS
+        logging.info(f'Training phase: {cfg.TRAIN_PHASE}')
+        logging.info(f'Loading Model: {cfg.NAME}, backbone: {cfg.BACKBONE}')
+        super().__init__(backbone, num_classes, modals)
+
+        # Get backbone channels
+        channels = self.backbone.channels
+        # print(channels)
+        hidden_dim = 256 if 'B0' in backbone or 'B1' in backbone else 512
+
+        # Initialize heads
+        self.decode_head = SegFormerHead([hidden_dim]*4, hidden_dim, num_classes)
+        self.conf_head = SegFormerHead([hidden_dim]*4, hidden_dim, 1)
+
+        # Dual attention head
+        self.da_head = DAHead(in_channels=channels, nclass = num_classes)
+
+        # Feature Pyramid Network (FPN) style enhancement
+        self.fpn_convs = nn.ModuleList()
+        self.fpn_laterals = nn.ModuleList()
+
+        # Create lateral connections and output convs for FPN
+        for i, c in enumerate(channels):
+            # Lateral connections (reduce channel dimensions)
+            self.fpn_laterals.append(nn.Conv2d(c, hidden_dim, kernel_size=1))
+
+            # Output convolutions (3x3 conv to smooth features)
+            self.fpn_convs.append(nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True)
+            ))
+
+        # Edge detection branch
+        self.edge_branch = ESB(2, sobel=True)
+        self.edge_channel_reduce = nn.Conv2d(2048, 1, kernel_size=1)
+
+        # Enhanced feature fusion with residual connections
+        self.adjust_layers = nn.ModuleList()
+        for c in [64, 128, 320, 512]:
+            # Create a more complex fusion module with residual connection
+            fusion_module = nn.Sequential(
+                # First branch: direct 1x1 conv (main path)
+                nn.Conv2d(c + 2, c, kernel_size=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+
+                # Second branch: deeper processing
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
+            )
+
+            # Residual connection wrapper
+            # Replace lambda with a proper nn.Module
+            class ResidualFusionModule(nn.Module):
+                def __init__(self, fusion_module, channels):
+                    super(ResidualFusionModule, self).__init__()
+                    self.fusion_module = fusion_module
+                    self.channels = channels
+                    
+                def forward(self, x):
+                    return self.fusion_module(x) + x[:, :self.channels, :, :]
+            
+            # Create module instance
+            residual_fusion = ResidualFusionModule(fusion_module, c)
+            
+            self.adjust_layers.append(residual_fusion)
+
+        # Enhanced detection head with more layers and wider dimensions
+        if cfg.DETECTION == 'confpool':
+            self.detection = nn.Sequential(
+                nn.Linear(8, 256),  # Wider first layer
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),  # Less aggressive dropout
+                nn.BatchNorm1d(256),
+                nn.Linear(256, 256),  # Additional layer
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),
+                nn.BatchNorm1d(256),
+                nn.Linear(256, 128),  # Additional layer
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),
+                nn.BatchNorm1d(128),
+                nn.Linear(128, 1),
+                nn.Sigmoid()
+            )
+
+        self.train_phase = cfg.TRAIN_PHASE
+        assert self.train_phase in ['localization', 'detection']
+
+        # Initialize weights and load pretrained
+        self.apply(self._init_weights)
+        self.init_pretrained(cfg.PRETRAINED, backbone)
+
+        # Freeze parameters for detection phase
+        if self.train_phase == 'detection':
+            self._freeze_localization_params()
+
+    def _freeze_localization_params(self):
+        """Freeze backbone and localization head parameters"""
+        for module in [self.backbone, self.decode_head]:
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+
+    def set_train(self):
+        if self.train_phase == 'localization':
+            self.backbone.train()
+            self.decode_head.train()
+            self.edge_branch.train()
+            self.da_head.train()
+        elif self.train_phase == 'detection':
+            self.conf_head.train()
+            self.detection.train()
+            self.backbone.eval()
+            self.decode_head.train()
+        else:
+            raise ValueError(f'Train phase {self.train_phase} not recognized!')
+
+    def set_val(self):
+        if self.train_phase == 'localization':
+            self.backbone.eval()
+            self.decode_head.eval()
+        elif self.train_phase == 'detection':
+            self.conf_head.eval()
+            self.detection.eval()
+        else:
+            raise ValueError(f'Train phase {self.train_phase} not recognized!')
+
+    def forward(self, x: list, masks: list = None):
+    #   check for nan in inputs
+    #   if any(torch.isnan(t).any() for t in x):
+    #     logging.error("Input contains NaN values, check the model and inputs!")
+    #     raise ValueError("Input contains NaN values, check the model and inputs!")
+      # get semantic map and convert to float
+        sem_map = get_semantic_map(image=x[0])  # [1, 1, 512, 512]
+        sem_map = sem_map.unsqueeze(1).float()  # Convert to float and ensure [B, C, H, W] format
+        # Memory optimization: Use gradient checkpointing during training, disable during inference
+        use_checkpointing = self.training and hasattr(self, 'use_gradient_checkpointing') and self.use_gradient_checkpointing
+        
+        # get edge map with memory optimization
+        edges, edge_map = self.edge_branch(x[0])  # edge_map: [1, 1, 2048, 32, 32]
+        edge_map = edge_map.squeeze(2)  # Remove extra dimension to get [B, C, H, W]
+        # Reduce edge map channels to 1
+        edge_map = self.edge_channel_reduce(edge_map)  # Now shape: [B, 1, H, W]
+
+        # Use backbone with optional gradient checkpointing
+        if use_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+
+            if masks is not None:
+                y = checkpoint(create_custom_forward(self.backbone), x, masks)
+            else:
+                y = checkpoint(create_custom_forward(self.backbone), x)
+        else:
+            if masks is not None:
+                y = self.backbone(x, masks)
+            else:
+                y = self.backbone(x)
+
+        # Memory-efficient feature processing
+        enhanced_features = []
+
+
+        # Process features one at a time to reduce peak memory usage
+        for idx, feat in enumerate(y):
+            sem_maps_resized = F.interpolate(
+                sem_map,
+                size=feat.shape[2:],
+                mode='bilinear',
+                align_corners=False
+                )
+
+            # Resize edge map on-demand to save memory
+            edge_map_resized = F.interpolate(
+                edge_map, 
+                size=feat.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+
+            # Concatenate along channel dimension
+            enhanced_feat = torch.cat([feat, sem_maps_resized, edge_map_resized], dim=1)
+
+            # Apply enhanced fusion module with residual connection
+            enhanced_feat = self.adjust_layers[idx](enhanced_feat)
+
+            # Apply ReLU after residual connection (use in-place operation for memory efficiency)
+            enhanced_feat = F.relu(enhanced_feat, inplace=True)
+
+            enhanced_features.append(enhanced_feat)
+            
+            # Clean up intermediate tensors
+            del edge_map_resized, feat
+            if idx < len(y) - 1:  # Don't delete on last iteration as we still need it
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Clean up backbone features to free memory
+        del y
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Apply dual attention head for enhanced feature extraction
+        enhanced_features = self.da_head(enhanced_features)
+
+        # Apply FPN enhancement for multi-scale feature fusion
+        fpn_features = []
+
+        # Apply lateral connections to reduce channel dimensions
+        laterals = [self.fpn_laterals[i](feat) for i, feat in enumerate(enhanced_features)]
+
+        del enhanced_features
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Top-down pathway
+        prev_features = laterals[-1]
+        fpn_features.append(self.fpn_convs[-1](prev_features))
+
+        # Process from high to low resolution
+        for i in range(len(laterals) - 2, -1, -1):
+            # Upsample higher level features
+            upsample = F.interpolate(
+                prev_features, 
+                size=laterals[i].shape[2:],
+                mode='bilinear', 
+                align_corners=False
+            )
+
+            # Add lateral connection (skip connection)
+            prev_features = laterals[i] + upsample
+
+            # Clean up upsample tensor immediately
+            del upsample
+
+            # Apply 3x3 conv to smooth features
+            fpn_out = self.fpn_convs[i](prev_features)
+            fpn_features.insert(0, fpn_out)
+            
+            # Clean up lateral tensor after use
+            del laterals[i]
+
+        # Pass through decode head with FPN enhanced features
+        
+        del laterals
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+
+        out = self.decode_head(fpn_features)
+        out = F.interpolate(out, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+
+        if self.train_phase == 'detection':
+            # Use FPN-enhanced features for confidence prediction as well
+            conf = self.conf_head(fpn_features)
+            conf = F.interpolate(conf, size=x[0].shape[2:], mode='bilinear', align_corners=False)
+
+            from .layer_utils import weighted_statistics_pooling
+            f1 = weighted_statistics_pooling(conf).view(out.shape[0], -1)
+            f2 = weighted_statistics_pooling(out[:, 1:2, :, :] - out[:, 0:1, :, :], F.logsigmoid(conf)).view(
+                out.shape[0], -1)
+
+            # Pass through enhanced detection head
+            det = self.detection(torch.cat((f1, f2), -1))
+             # Clean up intermediate tensors
+            del f1, f2
+            
+            return out, conf, det
+        else:
+            # Clean up fpn_features after use in localization phase
+            del fpn_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        return out, edges, sem_map
+
+
+    def init_pretrained(self, pretrained: str = None, backbone: str = None) -> None:
+        if pretrained:
+            logging.info('Loading pretrained module: {}'.format(pretrained))
+            if self.backbone.num_modals > 0:
+                load_dualpath_model(self.backbone, pretrained, backbone)
+            else:
+                checkpoint = torch.load(pretrained, map_location='cpu')
+                if 'state_dict' in checkpoint.keys():
+                    checkpoint = checkpoint['state_dict']
+                if 'model' in checkpoint.keys():
+                    checkpoint = checkpoint['model']
+                msg = self.backbone.load_state_dict(checkpoint, strict=False)
+                print(msg)
+
+
+def load_dualpath_model(model, model_file, backbone):
+    extra_pretrained = model_file if 'MHSA' in backbone else None
+    if isinstance(extra_pretrained, str):
+        raw_state_dict_ext = torch.load(extra_pretrained, map_location=torch.device('cpu'))
+        if 'state_dict' in raw_state_dict_ext.keys():
+            raw_state_dict_ext = raw_state_dict_ext['state_dict']
+    if isinstance(model_file, str):
+        raw_state_dict = torch.load(model_file, map_location=torch.device('cpu'))
+        if 'model' in raw_state_dict.keys():
+            raw_state_dict = raw_state_dict['model']
+    else:
+        raw_state_dict = model_file
+
+    state_dict = {}
+    for k, v in raw_state_dict.items():
+        if k.find('patch_embed') >= 0:
+            state_dict[k] = v
+        elif k.find('block') >= 0:
+            state_dict[k] = v
+        elif k.find('norm') >= 0:
+            state_dict[k] = v
+
+    if isinstance(extra_pretrained, str):
+        for k, v in raw_state_dict_ext.items():
+            if k.find('patch_embed1.proj') >= 0:
+                state_dict[k.replace('patch_embed1.proj', 'extra_downsample_layers.0.proj.module')] = v
+            if k.find('patch_embed2.proj') >= 0:
+                state_dict[k.replace('patch_embed2.proj', 'extra_downsample_layers.1.proj.module')] = v
+            if k.find('patch_embed3.proj') >= 0:
+                state_dict[k.replace('patch_embed3.proj', 'extra_downsample_layers.2.proj.module')] = v
+            if k.find('patch_embed4.proj') >= 0:
+                state_dict[k.replace('patch_embed4.proj', 'extra_downsample_layers.3.proj.module')] = v
+
+            if k.find('patch_embed1.norm') >= 0:
+                for i in range(model.num_modals):
+                    state_dict[k.replace('patch_embed1.norm', 'extra_downsample_layers.0.norm.ln_{}'.format(i))] = v
+            if k.find('patch_embed2.norm') >= 0:
+                for i in range(model.num_modals):
+                    state_dict[k.replace('patch_embed2.norm', 'extra_downsample_layers.1.norm.ln_{}'.format(i))] = v
+            if k.find('patch_embed3.norm') >= 0:
+                for i in range(model.num_modals):
+                    state_dict[k.replace('patch_embed3.norm', 'extra_downsample_layers.2.norm.ln_{}'.format(i))] = v
+            if k.find('patch_embed4.norm') >= 0:
+                for i in range(model.num_modals):
+                    state_dict[k.replace('patch_embed4.norm', 'extra_downsample_layers.3.norm.ln_{}'.format(i))] = v
+            elif k.find('block') >= 0:
+                state_dict[k.replace('block', 'extra_block')] = v
+            elif k.find('norm') >= 0:
+                state_dict[k.replace('norm', 'extra_norm')] = v
+
+    msg = model.load_state_dict(state_dict, strict=False)
+    del state_dict
+
+
+if __name__ == '__main__':
+    from configs.cmnext_init_cfg import _C as cfg
+    logging.basicConfig(level=getattr(logging, 'INFO'))
+
+    model = CMNeXtWithConf(cfg.MODEL)
+    x = [torch.zeros(1, 3, 1024, 1024), torch.ones(1, 3, 1024, 1024), torch.ones(1, 3, 1024, 1024) * 2,
+         torch.ones(1, 3, 1024, 1024) * 3]
+    y = model(x)
+    print(y.shape)

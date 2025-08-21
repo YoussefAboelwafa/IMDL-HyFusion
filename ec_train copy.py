@@ -61,17 +61,6 @@ pretty_errors.configure(
     truncate_code=True,
     display_locals=True
 )
-
-import random
-seed = 38
-torch.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-gc.collect()
-first = True
-
 if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='')
@@ -179,13 +168,12 @@ if __name__ == '__main__':
     params.append(dict(params=cmnext_params[1]['params'] + modal_extract_params[1]['params'], weight_decay=.0,
                     lr=config.LEARNING_RATE))
 
-    #use adamw optimizer
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WD,
-        eps=1e-8
-    )
+    optimizer = torch.optim.SGD(params,
+                                lr=config.LEARNING_RATE,
+                                momentum=config.SGD_MOMENTUM,
+                                weight_decay=config.WD
+                                )
+
     iters_per_epoch = len(train_loader)
     iters = 0
     max_iters = config.EPOCHS * iters_per_epoch
@@ -208,19 +196,10 @@ if __name__ == '__main__':
 
     if args.ckpt and os.path.exists(args.ckpt):
         logging.info(f'Loading checkpoint from {args.ckpt}')
-        # ckpt = torch.load(args.ckpt, map_location=device)
-        # model.load_state_dict(ckpt['state_dict'])
-        # modal_extractor.load_state_dict(ckpt['extractor_state_dict']) 
-        # start_epoch = ckpt['epoch'] + 1
-        if args.ckpt:
-            result = model.load_training_checkpoint(
-                args.ckpt, 
-                modal_extractor=modal_extractor,
-                map_location=device
-            )
-            
-            start_epoch = result['epoch'] + 1
-            logging.info(f'Resuming training from epoch {start_epoch}')
+        ckpt = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        modal_extractor.load_state_dict(ckpt['extractor_state_dict']) 
+        start_epoch = ckpt['epoch'] + 1
     else:
         start_epoch = 0
     def train_epoch(epoch, model, modal_extractor, train_loader, criterion, optimizer, scaler, writer, device, config):
@@ -243,9 +222,9 @@ if __name__ == '__main__':
             # check for NaN in images and masks
             images = images.to(device, non_blocking=True)
             masks = masks.squeeze(1).to(device, non_blocking=True)
+            # del name  # Free memory if not needed
             
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-
                 modals = modal_extractor(images)
                 # check modals for NaN values
                 images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -431,11 +410,14 @@ if __name__ == '__main__':
         train.shuffle()  # for balanced sampling
 
 
+        # # Validation phase
+        # val_loss, f1_best, f1_fixed = validate_epoch(epoch, model, modal_extractor, val_loader,
+        #                                             criterion, writer, device, config)
         # Training phase
         train_loss = train_epoch(epoch, model, modal_extractor, train_loader, criterion, 
                                 optimizer, scaler, writer, device, config)
 
-        # # print(val_loss, f1_best, f1_fixed)
+        # print(val_loss, f1_best, f1_fixed)
         torch.cuda.empty_cache()
         gc.collect()
         # Validation phase
@@ -446,34 +428,34 @@ if __name__ == '__main__':
         # Save best model
         if val_loss < min_loss:
             min_loss = val_loss
-        result = {
-            'epoch': epoch,
-            'val_loss': val_loss,
-            'val_f1_best': f1_best,
-            'val_f1_fixed': f1_fixed,
-            'state_dict': model.state_dict(),
-            'extractor_state_dict': modal_extractor.state_dict()
-        }
-        save_path = f'./ckpt/{config.MODEL.NAME}/best_val_loss_epoch{epoch}.pth'
-        torch.save(result, save_path)
-        # print(ty)
-        # Log best model to wandb
-        wandb.log({
-            "best_val_loss": val_loss,
-            "best_f1_best": f1_best,
-            "best_f1_fixed": f1_fixed,
-            "best_model_epoch": epoch
-        })
-        wandb.save(save_path)
+            result = {
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'val_f1_best': f1_best,
+                'val_f1_fixed': f1_fixed,
+                'state_dict': model.state_dict(),
+                'extractor_state_dict': modal_extractor.state_dict()
+            }
+            save_path = f'./ckpt/{config.MODEL.NAME}/best_val_loss.pth'
+            torch.save(result, save_path)
+            # print(ty)
+            # Log best model to wandb
+            wandb.log({
+                "best_val_loss": val_loss,
+                "best_f1_best": f1_best,
+                "best_f1_fixed": f1_fixed,
+                "best_model_epoch": epoch
+            })
+            wandb.save(save_path)
 
         writer.flush()
 
     # Save final model
     result = {
         'epoch': config.EPOCHS - 1,
-        'val_loss': val_loss,
-        'val_f1_best': f1_best,
-        'val_f1_fixed': f1_fixed,
+        # 'val_loss': val_loss,
+        # 'val_f1_best': f1_best,
+        # 'val_f1_fixed': f1_fixed,
         'state_dict': model.state_dict(),
         'extractor_state_dict': modal_extractor.state_dict()
     }

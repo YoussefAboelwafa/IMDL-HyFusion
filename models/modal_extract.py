@@ -65,6 +65,19 @@ class ModalitiesExtractor(nn.Module):
                 with torch.cuda.stream(streams[i]):
                     # Use memory-efficient operations
                     with torch.no_grad() if isinstance(mod, self.noiseprint.__class__) else torch.enable_grad():
+                        # print(x.shape,x.dtype)
+                        # # print max number in the tensor
+                        # print("Max value in tensor:", x.max().item())
+                        # print("Min value in tensor:", x.min().item())
+
+                        # # if max value is greater than 1.0, throw an error
+                        # if x.max() > 1.0:
+                        #     raise ValueError("Input tensor has values greater than 1.0, expected normalized input.")
+                        # if x.min() < 0.0:
+                        #     raise ValueError("Input tensor has values less than 0.0, expected normalized input.")
+                        # # if image has nan values, throw an error
+                        # if torch.isnan(x).any():
+                        #     raise ValueError("Input tensor contains NaN values.")
                         y = mod(x)
                         if y.size()[-3] == 1:
                             # Use expand instead of tile for better memory efficiency

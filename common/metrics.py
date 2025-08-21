@@ -2,7 +2,7 @@
 Taken from: https://github.com/grip-unina/TruFor
 """
 import numpy as np
-
+import cv2
 
 def extractGTs(gt, erodeKernSize=15, dilateKernSize=11):
     from scipy.ndimage import minimum_filter, maximum_filter
@@ -38,14 +38,18 @@ def computeMetricsContinue(values, gt0, gt1):
 
 
 def computeMetrics_th(values, gt, gt0, gt1, th):
-    values = values > th
-    values = values.flatten().astype(np.uint8)
-    gt = gt.flatten().astype(np.uint8)
-    gt0 = gt0.flatten().astype(np.uint8)
-    gt1 = gt1.flatten().astype(np.uint8)
+    # Resize prediction to match GT
+    if values.shape != gt0.shape:
+        values = cv2.resize(values, (gt0.shape[1], gt0.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    gt = gt[(gt0 + gt1) > 0]
-    values = values[(gt0 + gt1) > 0]
+    values = (values > th).astype(np.uint8).flatten()
+    gt = gt.astype(np.uint8).flatten()
+    gt0 = gt0.astype(np.uint8).flatten()
+    gt1 = gt1.astype(np.uint8).flatten()
+
+    mask = (gt0 + gt1) > 0
+    gt = gt[mask]
+    values = values[mask]
 
     from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(gt, values, labels=[0, 1])
@@ -56,7 +60,6 @@ def computeMetrics_th(values, gt, gt0, gt1, th):
     TP = cm[1, 1]
 
     return FP, TP, FN, TN
-
 
 def computeMCC(FP, TP, FN, TN):
     FP = np.float64(FP)

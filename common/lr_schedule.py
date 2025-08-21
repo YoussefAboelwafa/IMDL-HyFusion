@@ -34,19 +34,25 @@ class PolyLR(BaseLR):
 
 
 class WarmUpPolyLR(BaseLR):
-    def __init__(self, optimizer, start_lr, lr_power, total_iters, warmup_steps):
+    def __init__(self, optimizer, start_lr, lr_power, total_iters, warmup_steps, min_lr=0.0):
         super().__init__(optimizer)
         self.start_lr = start_lr
         self.lr_power = lr_power
-        self.total_iters = total_iters + 0.0
+        self.total_iters = float(total_iters)
         self.warmup_steps = warmup_steps
+        self.min_lr = min_lr
 
     def update_lr(self, cur_iter):
         if cur_iter < self.warmup_steps:
-            self.curr_lr = self.start_lr * (cur_iter / self.warmup_steps)
+            # Linear warmup from 0 to start_lr
+            warmup_lr = self.start_lr * (cur_iter / self.warmup_steps)
+            self.curr_lr = max(self.min_lr, warmup_lr)
         else:
-            self.curr_lr = self.start_lr * (
-                    (1 - float(cur_iter) / self.total_iters) ** self.lr_power)
+            # Poly decay from start_lr to min_lr
+            poly_decay = ((1 - float(cur_iter) / self.total_iters) ** self.lr_power)
+            decayed_lr = self.min_lr + (self.start_lr - self.min_lr) * poly_decay
+            self.curr_lr = max(self.min_lr, decayed_lr)
+
 
 
 if __name__ == "__main__":

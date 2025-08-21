@@ -13,3 +13,6 @@ ckpt/
 wandb/
 *.log
 *.pt
+inference_results_mm_columbia/
+inference_results_seg_columbia/
+results/

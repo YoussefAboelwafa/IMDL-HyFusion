@@ -80,7 +80,7 @@ def make_net(nplanes_in, kernels, features, bns, acts, dilats, bn_momentum = 0.1
         layers.append(elem)
 
         if bns[i]:
-            elem = nn.BatchNorm2d(features[i], momentum = bn_momentum)
+            elem = nn.BatchNorm2d(features[i], momentum = bn_momentum, eps=7e-5)
             batchnorm_init(elem, kernelsize=kernels[i])
             layers.append(elem)
 

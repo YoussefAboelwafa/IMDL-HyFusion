@@ -58,6 +58,19 @@ class TruForLoss(torch.nn.Module):
 
         loss_bce = self.criterion_bce(logits, target)
         loss_dice = self.criterion_dice(logits, target)
+        # if torch.isnan(loss_bce):
+        #     if torch.isnan(logits).any():
+        #         raise ValueError("logits contain NaN values, cannot compute BCE loss")
+        #     if torch.isnan(loss_dice):
+        #         raise ValueError("DICE loss is NaN, returning BCE loss only")
+            # print("logits", logits)
+            # print("BCE loss is NaN, returning DICE loss only")
+            # raise ValueError("BCE loss is NaN, returning DICE loss only")
+        # if torch.isnan(loss_dice):
+        #     print("DICE loss is NaN, returning BCE loss only")
+        #     raise ValueError("DICE loss is NaN, returning BCE loss only")
+        #     return loss_bce
+
         loss = self.lambda_ce * loss_bce + (1 - self.lambda_ce) * loss_dice
         return loss
 
